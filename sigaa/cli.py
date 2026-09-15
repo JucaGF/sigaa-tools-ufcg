@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
 import time
 import unicodedata
@@ -23,8 +25,10 @@ from .documents import (
     write_academic_document,
 )
 from .exporters.ics import build_calendar
+from .extraordinary import CLASS_LABEL, COMPONENT_CODE, ExtraordinaryWorker
 from .http import AuthError
 from .parsers.curriculum import CurriculumDataError
+from .parsers.matricula_extraordinaria import normalize_class
 from .parsers.schedule import day_name, decode_schedule
 from .parsers.sipac import SipacParseError
 from .parsers.transcript import CraUnavailableError, TranscriptParseError
@@ -38,6 +42,14 @@ from .sipac import (
 )
 from .store.db import connect
 from .store.repository import Repository
+from .ufcg import UFCGError, UFCGSession
+
+# Credential storage for the UFCG worker, kept separate from the UFPB
+# `sigaa-ufpb` service in sigaa/config.py (SPEC §20; this task's plan-local
+# key layout): service "sigaa-ufcg", active-username pointer, per-user
+# password, and "<user>:birth_date" for the (not yet used) confirmation step.
+_UFCG_KEYRING_SERVICE = "sigaa-ufcg"
+_UFCG_ACTIVE_USERNAME_KEY = "__active_username__"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -46,7 +58,9 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "func", None):
         parser.print_help()
         return 1
-    if getattr(args, "public_without_settings", False):
+    if args.command == "matricula-extraordinaria":
+        settings = None
+    elif getattr(args, "public_without_settings", False):
         settings = None
     else:
         settings = Settings()
@@ -171,6 +185,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_matr.add_argument("--confirm", action="store_true", help="press CONFIRMAR MATRÍCULAS after selecting (submits the request)")
     p_matr.add_argument("--json", action="store_true")
     p_matr.set_defaults(func=_cmd_matricula)
+
+    p_extra = sub.add_parser(
+        "matricula-extraordinaria",
+        help="UFCG matrícula extraordinária: dry-run search only in this version (networked)",
+    )
+    p_extra.add_argument("--codigo", required=True, help="component code (must be 1109103)")
+    p_extra.add_argument("--turma", required=True, help="turma label (must normalize to 02)")
+    p_extra.add_argument("--watch", action="store_true", help="not enabled yet (returns exit 5)")
+    p_extra.add_argument("--confirm", action="store_true", help="not enabled yet (returns exit 5)")
+    p_extra.add_argument(
+        "--interval", type=float, default=20.0, help="seconds between polls (default 20, min 10)"
+    )
+    p_extra.add_argument("--json", action="store_true")
+    p_extra.set_defaults(func=_cmd_matricula_extraordinaria)
 
     p_hist = sub.add_parser("historico", help="download the academic transcript PDF (networked)")
     p_hist.add_argument("--out", default="historico.pdf", help="output file (default: historico.pdf)")
@@ -559,6 +587,94 @@ def _cmd_matricula(args, settings: Settings) -> int:
         number = matricula_parser.parse_request_number(receipt)
         print(f"solicitação nº {number}" if number else "no request number found; verify in SIGAA")
     return 0
+
+
+def _ufcg_username() -> str | None:
+    """Active account saved by keyring `sigaa-ufcg`, else `SIGAA_USER`."""
+    try:
+        import keyring
+
+        active = keyring.get_password(_UFCG_KEYRING_SERVICE, _UFCG_ACTIVE_USERNAME_KEY)
+    except Exception:
+        active = None
+    return active or os.environ.get("SIGAA_USER")
+
+
+def _ufcg_secret(username: str, kind: str) -> str | None:
+    """`kind` is 'password' or 'birth_date': keyring `sigaa-ufcg` first, env second.
+
+    A missing/erroring keyring backend falls back to env; resolution happens
+    fresh on every call (never cached), so this doubles as both the CLI's
+    preflight existence check and the lazy resolver the session/worker use.
+    """
+    if kind == "password":
+        keyring_key, env_var = username, "SIGAA_PASS"
+    else:
+        keyring_key, env_var = f"{username}:birth_date", "SIGAA_BIRTH_DATE"
+    try:
+        import keyring
+
+        secret = keyring.get_password(_UFCG_KEYRING_SERVICE, keyring_key)
+    except Exception:
+        secret = None
+    return secret or os.environ.get(env_var)
+
+
+def _ufcg_result(args, status: str, message: str, exit_code: int) -> int:
+    """Emit the SPEC §21 output contract: JSON has exactly status/component_code/class/message."""
+    if args.json:
+        print(json.dumps(
+            {"status": status, "component_code": COMPONENT_CODE, "class": CLASS_LABEL, "message": message},
+            ensure_ascii=False,
+        ))
+    else:
+        print(message)
+    return exit_code
+
+
+def _cmd_matricula_extraordinaria(args, settings) -> int:
+    # This command resolves its own `sigaa-ufcg` credentials; UFPB Settings is
+    # never constructed for it (main() short-circuits `settings` to None).
+    del settings
+    if args.codigo != COMPONENT_CODE:
+        return _ufcg_result(args, "error", f"--codigo must be {COMPONENT_CODE} in this configuration", 5)
+    if normalize_class(args.turma) != normalize_class(CLASS_LABEL):
+        return _ufcg_result(args, "error", f"--turma must normalize to {CLASS_LABEL}", 5)
+    if not math.isfinite(args.interval) or args.interval < 10:
+        return _ufcg_result(args, "error", "--interval must be a finite number >= 10 seconds", 5)
+    if getattr(args, "user", None):
+        return _ufcg_result(
+            args, "error", "the global --user override is not supported for matricula-extraordinaria", 5
+        )
+    if args.confirm:
+        return _ufcg_result(args, "error", "--confirm is not enabled yet in this version", 5)
+    if args.watch:
+        return _ufcg_result(args, "error", "--watch is not enabled yet in this version", 5)
+
+    username = _ufcg_username()
+    if not username:
+        return _ufcg_result(
+            args, "error", "UFCG username not configured (keyring service 'sigaa-ufcg' or SIGAA_USER)", 5
+        )
+    if _ufcg_secret(username, "password") is None:
+        return _ufcg_result(
+            args, "error", "UFCG password not configured (keyring service 'sigaa-ufcg' or SIGAA_PASS)", 5
+        )
+
+    def confirmation_secret(kind: str) -> str:
+        secret = _ufcg_secret(username, kind)
+        if secret is None:
+            raise UFCGError(f"UFCG {kind} not configured", category="auth")
+        return secret
+
+    try:
+        with UFCGSession(username, lambda: confirmation_secret("password")) as session:
+            worker = ExtraordinaryWorker(session, confirmation_secret)
+            result = worker.run(confirm=args.confirm, watch=args.watch, interval=args.interval)
+    except KeyboardInterrupt:
+        print("\nmatrícula extraordinária: interrupted", file=sys.stderr)
+        return 130
+    return _ufcg_result(args, result.status, result.message, result.exit_code)
 
 
 def _cmd_academic_document(args, settings: Settings) -> int:

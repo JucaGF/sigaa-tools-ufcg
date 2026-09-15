@@ -26,7 +26,9 @@ _MENU_TARGET = "matriculaExtraordinaria.iniciar"
 # double) string that contains the target, wherever it lives.
 _MENU_ACTION_RE = re.compile(r"[\"']([^\"']*" + re.escape(_MENU_TARGET) + r"[^\"']*)[\"']")
 _PORTAL_PATH = "/sigaa/portais/discente/discente.jsf"
+_EXTRAORDINARY_PATH = "/sigaa/graduacao/matricula/extraordinaria/matricula_extraordinaria.jsf"
 _CLASS_RE = re.compile(r"(?:turma\s+)?0*(\d+)", re.IGNORECASE)
+_PERIOD_CLOSED_TEXT = "matrícula extraordinária não está disponível no momento"
 
 
 @dataclass(frozen=True)
@@ -168,6 +170,31 @@ def is_authenticated_portal(html: str, url: str) -> bool:
     if logout is None:
         return False
     return "sair" in logout.get_text(strip=True).casefold()
+
+
+def is_period_closed(html: str, url: str) -> bool:
+    """True when the render signals the extraordinária window is not open.
+
+    Covers the three SPEC §8.4 signals together, so both the flow's "open"
+    step (menu/direct-endpoint result) and its "search" step (search POST
+    result) can reuse the same check:
+
+    - an explicit period message;
+    - a bounce back to the authenticated portal;
+    - the search form being absent while the URL sits outside the
+      extraordinária flow (a not-yet-modeled success/results render would
+      still be *on* that flow's URL, so this is safe to read as closed).
+    """
+    normalized = unicodedata.normalize("NFKC", html).casefold()
+    if _PERIOD_CLOSED_TEXT in normalized:
+        return True
+    if is_authenticated_portal(html, url):
+        return True
+    path = urlparse(url).path.split(";")[0]
+    if path == _EXTRAORDINARY_PATH:
+        return False
+    soup = BeautifulSoup(html, "lxml")
+    return soup.find("form", attrs={"name": "form"}) is None
 
 
 def _require_viewstate(hidden_nodes, context: str) -> None:

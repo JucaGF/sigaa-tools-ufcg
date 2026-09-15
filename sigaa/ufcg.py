@@ -19,6 +19,9 @@ HOST = "sigaa.ufcg.edu.br"
 BASE_URL = f"https://{HOST}/sigaa"
 LOGIN_URL = f"{BASE_URL}/verTelaLogin.do"
 PORTAL_URL = f"{BASE_URL}/portais/discente/discente.jsf"
+# Direct endpoint (SPEC §8.3): fallback when the menu postback is absent or
+# reports the period as closed.
+DIRECT_URL = f"{BASE_URL}/graduacao/matricula/extraordinaria/matricula_extraordinaria.jsf"
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
 

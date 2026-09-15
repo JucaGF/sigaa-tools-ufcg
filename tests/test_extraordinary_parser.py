@@ -6,6 +6,7 @@ from sigaa.parsers.matricula_extraordinaria import (
     FormAction,
     build_form_payload,
     is_authenticated_portal,
+    is_period_closed,
     login_action,
     menu_action,
     normalize_class,
@@ -197,3 +198,33 @@ def test_is_authenticated_portal_false_on_substring_match_outside_the_path():
 def test_form_action_repr_hides_field_values():
     action = FormAction("https://sigaa.ufcg.edu.br/x", (("user.senha", "topsecret"),))
     assert "topsecret" not in repr(action)
+
+
+# --- is_period_closed ---------------------------------------------------
+
+
+def test_is_period_closed_true_on_explicit_message():
+    assert is_period_closed(_fixture("period_closed.html"), SEARCH_URL) is True
+
+
+def test_is_period_closed_true_on_bounce_to_authenticated_portal():
+    assert is_period_closed(_fixture("portal.html"), PORTAL_URL) is True
+
+
+def test_is_period_closed_true_when_search_form_lost_outside_the_flow():
+    # No period message, no portal bounce, but the URL sits outside the
+    # extraordinária flow and the search form is gone -- SPEC §8.4's third
+    # signal.
+    html = "<html><body>Sessão encerrada.</body></html>"
+    assert is_period_closed(html, PORTAL_URL.replace("discente.jsf", "outra.jsf")) is True
+
+
+def test_is_period_closed_false_when_search_form_present_on_the_flow_url():
+    assert is_period_closed(_fixture("search.html"), SEARCH_URL) is False
+
+
+def test_is_period_closed_false_on_unrecognized_render_still_on_the_flow_url():
+    # A render on the extraordinária URL that isn't the search form (e.g. the
+    # not-yet-modeled results page) must not be misclassified as closed.
+    html = "<html><body><div id='resultados'>...</div></body></html>"
+    assert is_period_closed(html, SEARCH_URL) is False

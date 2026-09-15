@@ -78,6 +78,46 @@ Agents can call `sipac_get_public_process` with `{"number": "23074.056437/2026-2
 Headless fallback: `export SIGAA_USER=... SIGAA_PASS=...`.
 Optional `SIGAA_DB=/path/to/sigaa.db` to override the store location.
 
+## UFCG matrícula extraordinária (experimental, dry-run only)
+
+A separate, local, deterministic worker for the UFCG SIGAA (not UFPB): it
+logs in, opens matrícula extraordinária, and searches component `1109103`
+turma `02` — the only target this version supports. It never touches the
+UFPB session/config/keyring, the regular `matricula` command, or the MCP
+server.
+
+```bash
+sigaa matricula-extraordinaria --codigo 1109103 --turma 02 --json
+```
+
+This is currently a **dry-run search only**: it authenticates, opens the
+extraordinária (menu postback, falling back to the direct endpoint), submits
+the search, and reports one of `period_closed`, `session_expired`, or
+`error` (SIGAA's real results page still isn't captured/modeled, so a
+successful search reports `error` with the message `captura de resultados
+necessária`). `--confirm` and `--watch` are accepted by the parser but both
+currently return exit code 5 ("not enabled yet") — `--watch` is not enabled
+until a later polling/backoff task, and `--confirm` stays disabled until a
+real capture of the confirmation form exists and is tested. No mutation is
+possible from this command yet.
+
+Credentials use their own keyring service, **`sigaa-ufcg`** (separate from
+UFPB's `sigaa-ufpb`):
+
+| Secret | Keyring key (service `sigaa-ufcg`) | Env fallback |
+| --- | --- | --- |
+| Username | `__active_username__` | `SIGAA_USER` |
+| Password | `<username>` | `SIGAA_PASS` |
+| Birth date (confirmation only, unused so far) | `<username>:birth_date` | `SIGAA_BIRTH_DATE` |
+
+A missing or erroring keyring backend falls back to the environment
+variables. The global `--user` override is not supported for this command
+(it always resolves its own `sigaa-ufcg` identity) and returns exit 5 if
+passed. Exit codes follow the SPEC: `2` period closed, `5` auth/config, `6`
+protocol/DOM, `7` network or unresolved session expiry. See
+`docs/superpowers/specs/2026-09-14-ufcg-matricula-extraordinaria-agent-design.md`
+for the full design and phase plan.
+
 ## MCP server (for code agents)
 
 Run `sigaa init`; it can detect or create `.mcp.json` and add the `sigaa` MCP

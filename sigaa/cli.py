@@ -192,10 +192,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_extra.add_argument("--codigo", required=True, help="component code (must be 1109103)")
     p_extra.add_argument("--turma", required=True, help="turma label (must normalize to 02)")
-    p_extra.add_argument("--watch", action="store_true", help="not enabled yet (returns exit 5)")
-    p_extra.add_argument("--confirm", action="store_true", help="not enabled yet (returns exit 5)")
+    p_extra.add_argument(
+        "--watch", action="store_true",
+        help="repeat while the period is closed, with backoff on transient errors",
+    )
+    p_extra.add_argument(
+        "--confirm", action="store_true",
+        help="not enabled yet (returns exit 5): mutation is gated on a real results/confirmation capture",
+    )
     p_extra.add_argument(
         "--interval", type=float, default=20.0, help="seconds between polls (default 20, min 10)"
+    )
+    p_extra.add_argument(
+        "--capture", metavar="DIR",
+        help="diagnostic only: write every HTML render to DIR (0700/0600); refused inside the git work tree",
     )
     p_extra.add_argument("--json", action="store_true")
     p_extra.set_defaults(func=_cmd_matricula_extraordinaria)
@@ -606,6 +616,8 @@ def _ufcg_secret(username: str, kind: str) -> str | None:
     A missing/erroring keyring backend falls back to env; resolution happens
     fresh on every call (never cached), so this doubles as both the CLI's
     preflight existence check and the lazy resolver the session/worker use.
+    An empty or whitespace-only value (e.g. ``SIGAA_PASS=""``) is treated the
+    same as unset, so a blank password is never POSTed.
     """
     if kind == "password":
         keyring_key, env_var = username, "SIGAA_PASS"
@@ -617,7 +629,19 @@ def _ufcg_secret(username: str, kind: str) -> str | None:
         secret = keyring.get_password(_UFCG_KEYRING_SERVICE, keyring_key)
     except Exception:
         secret = None
-    return secret or os.environ.get(env_var)
+    value = secret or os.environ.get(env_var)
+    return value if value and value.strip() else None
+
+
+def _capture_dir_inside_git_worktree(path: Path) -> bool:
+    """True when ``path`` (or any ancestor) sits inside a git work tree.
+
+    A plain filesystem walk for a `.git` entry (directory or, for a linked
+    worktree, a file) rather than shelling out to git -- no subprocess, works
+    for a directory that does not exist yet.
+    """
+    resolved = path.resolve()
+    return any((candidate / ".git").exists() for candidate in (resolved, *resolved.parents))
 
 
 def _ufcg_result(args, status: str, message: str, exit_code: int) -> int:
@@ -636,40 +660,49 @@ def _cmd_matricula_extraordinaria(args, settings) -> int:
     # This command resolves its own `sigaa-ufcg` credentials; UFPB Settings is
     # never constructed for it (main() short-circuits `settings` to None).
     del settings
-    if args.codigo != COMPONENT_CODE:
-        return _ufcg_result(args, "error", f"--codigo must be {COMPONENT_CODE} in this configuration", 5)
-    if normalize_class(args.turma) != normalize_class(CLASS_LABEL):
-        return _ufcg_result(args, "error", f"--turma must normalize to {CLASS_LABEL}", 5)
-    if not math.isfinite(args.interval) or args.interval < 10:
-        return _ufcg_result(args, "error", "--interval must be a finite number >= 10 seconds", 5)
-    if getattr(args, "user", None):
-        return _ufcg_result(
-            args, "error", "the global --user override is not supported for matricula-extraordinaria", 5
-        )
-    if args.confirm:
-        return _ufcg_result(args, "error", "--confirm is not enabled yet in this version", 5)
-    if args.watch:
-        return _ufcg_result(args, "error", "--watch is not enabled yet in this version", 5)
-
-    username = _ufcg_username()
-    if not username:
-        return _ufcg_result(
-            args, "error", "UFCG username not configured (keyring service 'sigaa-ufcg' or SIGAA_USER)", 5
-        )
-    if _ufcg_secret(username, "password") is None:
-        return _ufcg_result(
-            args, "error", "UFCG password not configured (keyring service 'sigaa-ufcg' or SIGAA_PASS)", 5
-        )
-
-    def confirmation_secret(kind: str) -> str:
-        secret = _ufcg_secret(username, kind)
-        if secret is None:
-            raise UFCGError(f"UFCG {kind} not configured", category="auth")
-        return secret
-
     try:
+        if args.codigo != COMPONENT_CODE:
+            return _ufcg_result(args, "error", f"--codigo must be {COMPONENT_CODE} in this configuration", 5)
+        if normalize_class(args.turma) != normalize_class(CLASS_LABEL):
+            return _ufcg_result(args, "error", f"--turma must normalize to {CLASS_LABEL}", 5)
+        if not math.isfinite(args.interval) or args.interval < 10:
+            return _ufcg_result(args, "error", "--interval must be a finite number >= 10 seconds", 5)
+        if getattr(args, "user", None):
+            return _ufcg_result(
+                args, "error", "the global --user override is not supported for matricula-extraordinaria", 5
+            )
+        if args.confirm:
+            return _ufcg_result(args, "error", "--confirm is not enabled yet in this version", 5)
+
+        capture_dir = None
+        if getattr(args, "capture", None):
+            capture_path = Path(args.capture)
+            if _capture_dir_inside_git_worktree(capture_path):
+                return _ufcg_result(
+                    args, "error",
+                    f"--capture must be outside the git work tree (refused: {capture_path})", 5,
+                )
+            capture_dir = capture_path
+
+        username = _ufcg_username()
+        if not username:
+            return _ufcg_result(
+                args, "error", "UFCG username not configured (keyring service 'sigaa-ufcg' or SIGAA_USER)", 5
+            )
+        if not _ufcg_secret(username, "password"):
+            return _ufcg_result(
+                args, "error", "UFCG password not configured (keyring service 'sigaa-ufcg' or SIGAA_PASS)", 5
+            )
+
+        def confirmation_secret(kind: str) -> str:
+            secret = _ufcg_secret(username, kind)
+            if not secret:
+                raise UFCGError(f"UFCG {kind} not configured", category="auth")
+            return secret
+
+        worker_kwargs = {"capture_dir": capture_dir} if capture_dir is not None else {}
         with UFCGSession(username, lambda: confirmation_secret("password")) as session:
-            worker = ExtraordinaryWorker(session, confirmation_secret)
+            worker = ExtraordinaryWorker(session, confirmation_secret, **worker_kwargs)
             result = worker.run(confirm=args.confirm, watch=args.watch, interval=args.interval)
     except KeyboardInterrupt:
         print("\nmatrícula extraordinária: interrupted", file=sys.stderr)

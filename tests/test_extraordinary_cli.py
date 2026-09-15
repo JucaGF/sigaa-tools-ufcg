@@ -5,6 +5,7 @@ resolution, and the JSON/log output contract.
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -54,59 +55,113 @@ def _never_open_session(monkeypatch):
     monkeypatch.setattr(cli_module, "UFCGSession", boom)
 
 
-def _never_touch_keyring(monkeypatch):
+def _never_touch_keyring(monkeypatch) -> dict:
+    """Returns a flag dict; callers assert ``not flag["called"]`` afterward.
+
+    The stub must prove it was never invoked on its own terms: raising
+    AssertionError alone doesn't work here, because `_ufcg_username`/
+    `_ufcg_secret` swallow any `Exception` from the keyring backend via a
+    broad `except Exception`, so a raised AssertionError would be silently
+    absorbed and the test would pass even if keyring *was* touched.
+    """
+    flag = {"called": False}
+
     def boom(*a, **k):
+        flag["called"] = True
         raise AssertionError("must not touch keyring for a rejected config")
 
     monkeypatch.setitem(sys.modules, "keyring", SimpleNamespace(get_password=boom))
+    return flag
 
 
 @pytest.mark.parametrize("codigo", ["1109104", "abc", ""])
 def test_wrong_component_code_returns_five_before_any_session(monkeypatch, codigo):
     _never_open_session(monkeypatch)
-    _never_touch_keyring(monkeypatch)
+    flag = _never_touch_keyring(monkeypatch)
     args = _parse("--codigo", codigo or "0", "--turma", "02")
     args.codigo = codigo
     assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
+    assert not flag["called"]
 
 
 @pytest.mark.parametrize("turma", ["12", "02/01", "202", "01"])
 def test_wrong_turma_returns_five_before_any_session(monkeypatch, turma):
     _never_open_session(monkeypatch)
-    _never_touch_keyring(monkeypatch)
+    flag = _never_touch_keyring(monkeypatch)
     args = _parse("--codigo", "1109103", "--turma", turma)
     assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
+    assert not flag["called"]
 
 
 @pytest.mark.parametrize("interval", [9, 0, -1, float("nan"), float("inf"), float("-inf")])
 def test_interval_below_minimum_or_non_finite_returns_five(monkeypatch, interval):
     _never_open_session(monkeypatch)
-    _never_touch_keyring(monkeypatch)
+    flag = _never_touch_keyring(monkeypatch)
     args = _parse("--codigo", "1109103", "--turma", "02")
     args.interval = interval
     assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
+    assert not flag["called"]
 
 
 def test_global_user_override_returns_five(monkeypatch):
     _never_open_session(monkeypatch)
-    _never_touch_keyring(monkeypatch)
+    flag = _never_touch_keyring(monkeypatch)
     args = _parse("--codigo", "1109103", "--turma", "02")
     args.user = "someone"
     assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
+    assert not flag["called"]
 
 
 def test_confirm_returns_five_before_any_session(monkeypatch):
     _never_open_session(monkeypatch)
-    _never_touch_keyring(monkeypatch)
+    flag = _never_touch_keyring(monkeypatch)
     args = _parse("--codigo", "1109103", "--turma", "02", "--confirm")
     assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
+    assert not flag["called"]
 
 
-def test_watch_returns_five_before_any_session(monkeypatch):
-    _never_open_session(monkeypatch)
-    _never_touch_keyring(monkeypatch)
+def test_watch_alone_is_no_longer_rejected_and_reaches_the_worker(monkeypatch):
+    # `--watch` used to return 5 unconditionally; it's now accepted and wired
+    # through to the worker (`--confirm` is the flag that stays blocked).
+    monkeypatch.setitem(
+        sys.modules,
+        "keyring",
+        SimpleNamespace(get_password=lambda s, k: "jucag" if k == "__active_username__" else "s3cr3t"),
+    )
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    class FakeWorker:
+        def __init__(self, session, confirmation_secret, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            assert kwargs == {"confirm": False, "watch": True, "interval": 20.0}
+            return RunResult("period_closed", "matrícula extraordinária period is not open", 2)
+
+    monkeypatch.setattr(cli_module, "UFCGSession", FakeSession)
+    monkeypatch.setattr(cli_module, "ExtraordinaryWorker", FakeWorker)
     args = _parse("--codigo", "1109103", "--turma", "02", "--watch")
+    assert cli_module._cmd_matricula_extraordinaria(args, None) == 2
+
+
+def test_capture_inside_git_worktree_returns_five_before_any_session(monkeypatch):
+    _never_open_session(monkeypatch)
+    flag = _never_touch_keyring(monkeypatch)
+    # This repo's checkout itself is inside its own git work tree.
+    inside = str(Path(__file__).resolve().parents[1] / "some-capture-dir")
+    args = _parse("--codigo", "1109103", "--turma", "02", "--capture", inside)
     assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
+    assert not flag["called"]
+    assert not Path(inside).exists()
 
 
 # --- credentials: keyring service sigaa-ufcg, env fallback -------------------
@@ -118,6 +173,29 @@ def test_missing_username_returns_five_after_resolution(monkeypatch):
     monkeypatch.delenv("SIGAA_USER", raising=False)
     args = _parse("--codigo", "1109103", "--turma", "02")
     assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
+
+
+def test_blank_password_env_is_treated_as_missing_not_a_valid_empty_password(monkeypatch):
+    # SIGAA_PASS="" (or whitespace) used to pass the `is None` guard, so a
+    # blank password would have been POSTed. Isolated from real keyring/env.
+    _never_open_session(monkeypatch)
+    monkeypatch.setitem(sys.modules, "keyring", SimpleNamespace(get_password=lambda *a: None))
+    monkeypatch.setenv("SIGAA_USER", "envuser")
+    monkeypatch.setenv("SIGAA_PASS", "   ")
+    args = _parse("--codigo", "1109103", "--turma", "02")
+    assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
+
+
+def test_ufcg_secret_treats_blank_or_whitespace_env_value_as_unset(monkeypatch):
+    monkeypatch.setitem(sys.modules, "keyring", SimpleNamespace(get_password=lambda s, k: None))
+    monkeypatch.setenv("SIGAA_PASS", "   ")
+    assert cli_module._ufcg_secret("jucag", "password") is None
+
+
+def test_ufcg_secret_returns_a_non_blank_value_unchanged(monkeypatch):
+    monkeypatch.setitem(sys.modules, "keyring", SimpleNamespace(get_password=lambda s, k: None))
+    monkeypatch.setenv("SIGAA_PASS", "s3cr3t")
+    assert cli_module._ufcg_secret("jucag", "password") == "s3cr3t"
 
 
 def test_missing_password_returns_five_after_resolution(monkeypatch):

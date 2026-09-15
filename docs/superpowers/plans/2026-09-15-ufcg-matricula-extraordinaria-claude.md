@@ -397,7 +397,7 @@ def test_backoff_and_retry_after_bounds():
 
 ### Gate C — somente depois de tudo revisado
 
-A SPEC §27.8 exige: “Pare antes do primeiro POST live de confirmação e solicite autorização humana específica para a matrícula `1109103`, turma `02`.” O pedido deste plano não concede essa autorização. Apresentar o comando abaixo, o alvo, a evidência do dry-run e pedir aprovação específica no momento da execução:
+Atualizado em 15/09/2026: o autor da SPEC concedeu antecipadamente a autorização para o POST final em `1109103`, turma `02`, e pediu que o worker decida sozinho. O gate C deixa de ser uma pergunta por execução e passa a ser uma pré-condição técnica: preparação validada contra o contrato capturado, alvo reconferido na página de confirmação, envio único e verificação da pós-condição. O comando autorizado é:
 
 ```bash
 uv run sigaa matricula-extraordinaria --codigo 1109103 --turma 02 --watch --confirm --json

@@ -828,8 +828,10 @@ da versão real.
 
 ### Fase 3 — confirmação segura
 
-Adicionar confirmação e verificação usando testes de contrato. O primeiro teste
-live mutável exige autorização humana no momento da execução.
+Adicionar confirmação e verificação usando testes de contrato. A autorização
+humana para o primeiro POST live foi concedida pelo autor da SPEC em 15/09/2026,
+especificamente para `1109103`, turma `02`. O worker confirma sozinho quando a
+preparação estiver validada, sem nova pergunta no momento da execução.
 
 **Concluída quando:** confirmação única e pós-condição verificada funcionam, e o
 teste de timeout prova que não há reenvio cego.
@@ -871,8 +873,12 @@ sem vaga, vaga encontrada e sucesso sem concorrência.
 5. Use o HTML atual como fonte dos payloads JSF.
 6. Use fixtures sanitizadas; nunca use a conta real em testes automatizados.
 7. Pare no gate da Fase 2 se o período ainda não permitir capturar resultados.
-8. Pare antes do primeiro POST live de confirmação e solicite autorização humana
-   específica para a matrícula `1109103`, turma `02`.
+8. A autorização humana específica para a matrícula `1109103`, turma `02`, foi
+   concedida pelo autor em 15/09/2026 e vale enquanto `--confirm` for passado
+   explicitamente. O worker valida a preparação e envia o POST final sozinho, uma
+   única vez, sem pausa para nova confirmação humana. As travas técnicas
+   permanecem: alvo exato, reconhecimento do contrato atual, envio único e
+   verificação da pós-condição.
 9. Não adicione dependências: `httpx`, Beautiful Soup, `lxml`, stdlib e keyring já
    cobrem o problema.
 10. Não adicione framework multi-instituição, YAML, banco ou MCP mutável.
@@ -891,6 +897,9 @@ sem vaga, vaga encontrada e sucesso sem concorrência.
 - Dry-run é padrão.
 - Confirmação automática requer `--confirm`.
 - A confirmação não é repetida automaticamente.
+- O POST final é autorizado previamente pelo autor (15/09/2026) para o alvo fixo;
+  o gate humano por execução foi removido a pedido dele. `--confirm` continua
+  obrigatório e a preparação validada continua sendo pré-condição.
 - O SIGAA autenticado é a fonte operacional do período.
 - A implementação aguarda captura real dos resultados e da confirmação para
   habilitar mutação.

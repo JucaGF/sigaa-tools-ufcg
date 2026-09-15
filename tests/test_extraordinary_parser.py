@@ -126,6 +126,24 @@ def test_menu_action_returns_none_when_period_closed():
     assert menu_action(html, PORTAL_URL) is None
 
 
+def test_menu_action_finds_the_postback_inside_a_script_menu_array():
+    # A standard Tomahawk JSCookMenu render leaves the hidden jscook_action
+    # input empty and keeps the real postback string in a <script> array,
+    # set into the field by an onclick handler that never runs during a
+    # plain HTML fetch. The parser must search the whole render, not just
+    # the hidden field's default value.
+    html = _fixture("portal_script_menu.html")
+    action = menu_action(html, PORTAL_URL)
+    assert action is not None
+    fields = dict(action.fields)
+    assert fields["jscook_action"] == (
+        "menu_form_menu_discente_discente_menu:A]#{ matriculaExtraordinaria.iniciar}"
+    )
+    # the other hidden fields (ViewState included) still come from the form.
+    assert fields["id"] == "j_id_jsp_3333333_3"
+    assert fields["javax.faces.ViewState"] == "render-fake-0003"
+
+
 # --- search_action -----------------------------------------------------------
 
 
@@ -167,6 +185,13 @@ def test_is_authenticated_portal_false_when_login_form_still_present():
 
 def test_is_authenticated_portal_false_when_url_is_not_the_portal():
     assert is_authenticated_portal(_fixture("portal.html"), SEARCH_URL) is False
+
+
+def test_is_authenticated_portal_false_on_substring_match_outside_the_path():
+    # The portal path appearing as a query string value must not count: only
+    # the URL's own path is checked.
+    url = LOGIN_URL + "?urlRedirect=/sigaa/portais/discente/discente.jsf"
+    assert is_authenticated_portal(_fixture("portal.html"), url) is False
 
 
 def test_form_action_repr_hides_field_values():

@@ -119,6 +119,72 @@ def test_login_does_not_call_password_when_the_action_is_outside_the_expected_ho
     assert len(requests) == 1
 
 
+def test_login_raises_protocol_error_when_login_form_is_missing():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html><body>maintenance</body></html>")
+
+    session = _session(handler)
+    with pytest.raises(UFCGError) as excinfo:
+        session.login()
+    assert excinfo.value.category == "protocol"
+
+
+def test_login_raises_protocol_error_when_login_form_has_no_action_attribute():
+    html = _fixture("login.html").replace(
+        'action="/sigaa/logar.do;jsessionid=FAKEJSESSION0001?dispatch=logOn"', ""
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=html)
+
+    session = _session(handler)
+    with pytest.raises(UFCGError) as excinfo:
+        session.login()
+    assert excinfo.value.category == "protocol"
+
+
+def test_login_falls_back_to_a_portal_get_when_the_post_lands_elsewhere():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if request.method == "POST":
+            # No redirect, no loginForm, and not yet the portal either (e.g. a
+            # transitional loading page) -- SPEC §8.1 step 5 asks the session
+            # to try the portal directly before giving up.
+            return httpx.Response(200, text="<html><body>Carregando...</body></html>")
+        if request.url.path == "/sigaa/portais/discente/discente.jsf":
+            return httpx.Response(200, text=_fixture("portal.html"))
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    session = _session(handler)
+    response = session.login()
+    assert str(response.url) == PORTAL_URL
+    assert [r.url.path.split(";")[0] for r in requests] == [
+        "/sigaa/verTelaLogin.do",
+        "/sigaa/logar.do",
+        "/sigaa/portais/discente/discente.jsf",
+    ]
+
+
+def test_login_does_not_fall_back_to_portal_when_login_form_is_clearly_rejected():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        # Both the initial GET and the POST re-render the classic login page.
+        return httpx.Response(200, text=_fixture("login.html"))
+
+    session = _session(handler)
+    with pytest.raises(UFCGError) as excinfo:
+        session.login()
+    assert excinfo.value.category == "auth"
+    # exactly the GET + the POST -- no extra portal fallback GET was issued.
+    assert len(requests) == 2
+
+
 def test_login_is_reconstructed_with_a_fresh_get_and_action_each_call():
     renders = iter(["FIRSTSESSION0001", "SECONDSESSION0002"])
     get_count = 0

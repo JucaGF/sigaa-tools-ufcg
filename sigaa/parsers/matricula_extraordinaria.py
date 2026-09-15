@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
@@ -19,6 +19,13 @@ FormFields = list[tuple[str, str]]
 
 _VIEWSTATE_NAME = "javax.faces.ViewState"
 _MENU_TARGET = "matriculaExtraordinaria.iniciar"
+# The JSCookMenu postback string is not reliably in a hidden field's default
+# value: a standard Tomahawk render leaves the hidden `jscook_action` input
+# empty and keeps the real string in a <script> menu array, set into the
+# field by an onclick handler. Search the whole render for a quoted (single or
+# double) string that contains the target, wherever it lives.
+_MENU_ACTION_RE = re.compile(r"[\"']([^\"']*" + re.escape(_MENU_TARGET) + r"[^\"']*)[\"']")
+_PORTAL_PATH = "/sigaa/portais/discente/discente.jsf"
 _CLASS_RE = re.compile(r"(?:turma\s+)?0*(\d+)", re.IGNORECASE)
 
 
@@ -92,21 +99,26 @@ def login_action(html: str, url: str) -> FormAction:
 def menu_action(html: str, url: str) -> FormAction | None:
     """Extract the JSCookMenu postback that starts the extraordinária.
 
-    Returns ``None`` when the discente menu form is absent or none of its
-    hidden fields carry the ``matriculaExtraordinaria.iniciar`` postback (e.g.
-    the period is closed and the menu item is not rendered), so callers can
-    fall back to the direct endpoint per SPEC §8.3.
+    The target action string is searched across the *whole* render (hidden
+    field value, or a quoted string inside a `<script>` menu array — the shape
+    the real Tomahawk JSCookMenu markup is expected to use), not just the
+    `jscook_action` hidden field's default value, which is typically empty
+    until JS sets it on click. Returns ``None`` when the discente menu form is
+    absent or the target string is nowhere in the render (e.g. the period is
+    closed and the menu item is not rendered), so callers can fall back to the
+    direct endpoint per SPEC §8.3.
     """
     soup = BeautifulSoup(html, "lxml")
     form = soup.find("form", attrs={"name": "menu:form_menu_discente"})
     if form is None:
         return None
-    hidden = form.select('input[type="hidden"][name]')
-    if not any(_MENU_TARGET in node.get("value", "") for node in hidden):
+    match = _MENU_ACTION_RE.search(html)
+    if match is None:
         return None
+    hidden = form.select('input[type="hidden"][name]')
     _require_viewstate(hidden, "extraordinária menu form")
     action_url = urljoin(url, form["action"])
-    fields = build_form_payload(form, [])
+    fields = build_form_payload(form, [("jscook_action", match.group(1))])
     return FormAction(action_url, tuple(fields))
 
 
@@ -142,8 +154,12 @@ def is_authenticated_portal(html: str, url: str) -> bool:
     Per SPEC §8.1: the URL must be the discente portal, a `SAIR` link to
     ``logar.do?dispatch=logOff`` must be present, and no ``loginForm`` may
     remain in the DOM. The UFPB "Sair do SIGAA" marker is not used for UFCG.
+
+    The URL is matched on its path only (a substring match would wrongly pass
+    e.g. ``verTelaLogin.do?urlRedirect=/sigaa/portais/discente/discente.jsf``).
     """
-    if "/sigaa/portais/discente/discente.jsf" not in url:
+    path = urlparse(url).path.split(";")[0]
+    if path != _PORTAL_PATH:
         return False
     soup = BeautifulSoup(html, "lxml")
     if soup.find("form", attrs={"name": "loginForm"}) is not None:

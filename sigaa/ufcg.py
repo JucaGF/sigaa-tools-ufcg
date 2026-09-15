@@ -34,6 +34,11 @@ _BLOCKED_URL_MESSAGE = "SIGAA request blocked: URL outside the expected host"
 _TOO_MANY_REDIRECTS_MESSAGE = "SIGAA exceeded the redirect limit"
 _LOGIN_FAILED_MESSAGE = "SIGAA login failed (check credentials or CAPTCHA)"
 
+# Cheap gate for the SPEC §8.1 step-5 portal fallback: distinguishes an obvious
+# rejection (the classic loginForm re-rendered) from an ambiguous landing page,
+# without pulling DOM parsing into the session layer.
+_LOGIN_FORM_MARKER = 'name="loginForm"'
+
 
 class UFCGError(RuntimeError):
     """category: ``auth`` | ``protocol`` | ``network`` | ``session_expired``."""
@@ -67,7 +72,12 @@ class UFCGSession:
         after a bounce naturally reconstructs the login from the current render.
         """
         login_page = self.get(LOGIN_URL)
-        action = login_action(login_page.text, str(login_page.url))
+        try:
+            action = login_action(login_page.text, str(login_page.url))
+        except (ValueError, KeyError):
+            # Missing loginForm / missing action attribute: an unrecognized
+            # render, not a Python-internal error for the caller to see.
+            raise UFCGError(_PROTOCOL_ERROR_MESSAGE, category="protocol") from None
         # Validate before the password callable is ever invoked.
         self._validate_url(action.action)
         password = self._password()
@@ -84,9 +94,17 @@ class UFCGSession:
             location = response.headers.get("location")
             if location:
                 response = self.get(urljoin(str(response.url), location))
-        if not is_authenticated_portal(response.text, str(response.url)):
-            raise UFCGError(_LOGIN_FAILED_MESSAGE, category="auth")
-        return response
+        if is_authenticated_portal(response.text, str(response.url)):
+            return response
+        if _LOGIN_FORM_MARKER not in response.text:
+            # SPEC §8.1 step 5 ("abrir ou validar o Portal do Discente"): the
+            # POST landed somewhere that is neither an obvious rejection (the
+            # login form re-rendered) nor the portal itself. Try the portal
+            # directly, once, before concluding login failed.
+            response = self.get(PORTAL_URL)
+            if is_authenticated_portal(response.text, str(response.url)):
+                return response
+        raise UFCGError(_LOGIN_FAILED_MESSAGE, category="auth")
 
     def get(self, url: str) -> httpx.Response:
         """GET, following redirects manually. Every hop is validated (HTTPS,

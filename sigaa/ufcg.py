@@ -68,6 +68,12 @@ class UFCGSession:
             follow_redirects=False,
             timeout=30.0,
         )
+        # SPEC §18: one session, reused across --watch cycles; a caller
+        # (ExtraordinaryWorker) checks this before deciding whether a cycle
+        # needs a fresh credential POST or can just re-navigate the reused
+        # session. Cleared by the caller when a later render turns out to be
+        # the login page again.
+        self.authenticated = False
 
     def login(self) -> httpx.Response:
         """Authenticate. Every call does a fresh GET and uses the fresh action;
@@ -98,6 +104,7 @@ class UFCGSession:
             if location:
                 response = self.get(urljoin(str(response.url), location))
         if is_authenticated_portal(response.text, str(response.url)):
+            self.authenticated = True
             return response
         if _LOGIN_FORM_MARKER not in response.text:
             # SPEC §8.1 step 5 ("abrir ou validar o Portal do Discente"): the
@@ -106,6 +113,7 @@ class UFCGSession:
             # directly, once, before concluding login failed.
             response = self.get(PORTAL_URL)
             if is_authenticated_portal(response.text, str(response.url)):
+                self.authenticated = True
                 return response
         raise UFCGError(_LOGIN_FAILED_MESSAGE, category="auth")
 

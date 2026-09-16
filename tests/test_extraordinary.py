@@ -642,7 +642,134 @@ def test_watch_backoff_ladder_then_steps_back_down_to_interval_on_recovery():
     # 4 escalating transient failures, then 4 healthy cycles stepping the
     # backoff back down one notch at a time, never below the interval.
     assert delays == [30, 60, 120, 120, 120, 60, 30, 20]
-    assert login_calls["n"] == 8  # same session, fresh login/ViewState every cycle
+    # 4 failed pre-auth login attempts + 1 that succeeds; the session is then
+    # reused (SPEC §18: one session, no redundant credential POST) for the
+    # remaining 3 healthy cycles, so the count stops climbing at 5.
+    assert login_calls["n"] == 5
+
+
+def test_watch_reuses_the_session_and_logs_in_once_across_healthy_cycles():
+    login_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            login_calls["n"] += 1
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            return httpx.Response(200, text=_fixture("portal.html"))
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            return httpx.Response(200, text=_fixture("period_closed.html"))
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    delays: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 8:
+            raise KeyboardInterrupt
+
+    worker, _ = _worker(handler, sleep=fake_sleep, now=lambda: 0.0)
+    with pytest.raises(KeyboardInterrupt):
+        worker.run(watch=True, interval=20)
+
+    # 8 healthy cycles, one credential POST: every cycle still re-navigates
+    # portal -> menu -> search from a fresh render, it just never re-logs in.
+    assert login_calls["n"] == 1
+
+
+def test_watch_session_bounce_after_reuse_reauthenticates_once_and_continues():
+    # Distinct from the OPEN-phase bounce test above: this bounce happens on
+    # a cycle that was already relying on session reuse (cycle 2+), proving
+    # the authenticated flag flips back correctly mid-watch, not just on the
+    # very first cycle.
+    login_calls = {"n": 0}
+    portal_gets = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            login_calls["n"] += 1
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            portal_gets["n"] += 1
+            if portal_gets["n"] == 2:
+                # cycle 2's reused-session portal fetch finds the session dead.
+                return httpx.Response(200, text=_fixture("login.html"))
+            return httpx.Response(200, text=_fixture("portal.html"))
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            return httpx.Response(200, text=_fixture("period_closed.html"))
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    delays: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 3:
+            raise KeyboardInterrupt
+
+    worker, _ = _worker(handler, sleep=fake_sleep, now=lambda: 0.0)
+    with pytest.raises(KeyboardInterrupt):
+        worker.run(watch=True, interval=20)
+
+    # cycle 1: fresh login. cycle 2: reused GET finds the session dead, the
+    # one allowed reconstruction re-logs in and continues -- healthy, no
+    # backoff escalation. cycle 3: reused again, no extra login.
+    assert login_calls["n"] == 2
+    assert delays == [20, 20, 20]  # never escalates: the bounce was recovered within its cycle
+
+
+def test_watch_search_post_never_replays_a_stale_viewstate_across_reused_cycles():
+    # The property most at risk from session reuse: a cached FormAction or
+    # ViewState from an earlier cycle must never reappear once the session
+    # stops being re-logged-in every cycle.
+    cycle = {"n": 0}
+    seen_menu_viewstates = []
+    seen_search_viewstates = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            cycle["n"] += 1
+            portal = _fixture("portal.html").replace("render-fake-0001", f"MENU-{cycle['n']}")
+            return httpx.Response(200, text=portal)
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            seen_menu_viewstates.append(_body(request).get("javax.faces.ViewState"))
+            search = _fixture("search.html").replace("render-fake-0002", f"SEARCH-{cycle['n']}")
+            return httpx.Response(200, text=search)
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            seen_search_viewstates.append(_body(request).get("javax.faces.ViewState"))
+            return httpx.Response(200, text=_fixture("period_closed.html"))
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    delays: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 3:
+            raise KeyboardInterrupt
+
+    worker, _ = _worker(handler, sleep=fake_sleep, now=lambda: 0.0)
+    with pytest.raises(KeyboardInterrupt):
+        worker.run(watch=True, interval=20)
+
+    assert seen_menu_viewstates == ["MENU-1", "MENU-2", "MENU-3"]
+    assert seen_search_viewstates == ["SEARCH-1", "SEARCH-2", "SEARCH-3"]
+    # no earlier cycle's ViewState is ever replayed on a later cycle's POST.
+    assert len(set(seen_menu_viewstates)) == 3
+    assert len(set(seen_search_viewstates)) == 3
 
 
 def test_watch_honors_a_valid_retry_after_header_even_below_the_backoff_ladder():

@@ -217,9 +217,17 @@ class ExtraordinaryWorker:
         return result
 
     def _attempt(self, confirm: bool) -> RunResult | object:
-        response = self._session.login()
+        # SPEC §18: one session, reused across cycles -- log in only when the
+        # session isn't already authenticated. Every cycle still re-navigates
+        # from a fresh render either way (nothing here is cached or replayed).
+        if self._session.authenticated:
+            response = self._session.get(PORTAL_URL)
+        else:
+            response = self._session.login()
+            _log("AUTHENTICATED")
         self._capture("portal", response.text)
-        _log("AUTHENTICATED")
+        if self._login_form(response.text):
+            return _SESSION_EXPIRED
         opened = self._open(response.text, str(response.url))
         if opened is _SESSION_EXPIRED:
             return _SESSION_EXPIRED
@@ -256,7 +264,7 @@ class ExtraordinaryWorker:
         search = self._safe_action(search_action, response.text, str(response.url), COMPONENT_CODE)
         if search is not None:
             return search
-        if _is_login_form_render(response.text):
+        if self._login_form(response.text):
             # A watch loop can hold this session open for hours; the classic
             # login form reappearing here means it died, not that the period
             # is closed (SPEC §17 "busca: sim, reconstruída").
@@ -268,7 +276,7 @@ class ExtraordinaryWorker:
         return RunResult("error", _NO_SEARCH_FORM_MESSAGE, 6)
 
     def _classify_search(self, html: str, url: str) -> RunResult | ExtraordinaryClass | object:
-        if _is_login_form_render(html):
+        if self._login_form(html):
             return _SESSION_EXPIRED
         if is_period_closed(html, url):
             _log("PERIOD_CLOSED")
@@ -304,7 +312,7 @@ class ExtraordinaryWorker:
             return RunResult("error", _SELECTION_UNRECOGNIZED_MESSAGE, 6)
         response = self._follow(self._session.post(select_form))
         self._capture("confirmation", response.text)
-        if _is_login_form_render(response.text):
+        if self._login_form(response.text):
             return _SESSION_EXPIRED
         if not _confirmation_matches_target(response.text, target):
             _log("FATAL_ERROR", reason="confirmation_target_mismatch")
@@ -409,7 +417,7 @@ class ExtraordinaryWorker:
             response = self._session.get(PORTAL_URL)
         except UFCGError:
             return False  # transient: this query is inconclusive, not proof either way
-        if _is_login_form_render(response.text):
+        if self._login_form(response.text):
             return _SESSION_EXPIRED
         self._capture("verification", response.text)
         return is_enrolled(response.text)
@@ -422,7 +430,7 @@ class ExtraordinaryWorker:
             portal_response = self._session.get(PORTAL_URL)
         except UFCGError:
             return False
-        if _is_login_form_render(portal_response.text):
+        if self._login_form(portal_response.text):
             return _SESSION_EXPIRED
         opened = self._open(portal_response.text, str(portal_response.url))
         if opened is _SESSION_EXPIRED:
@@ -435,6 +443,18 @@ class ExtraordinaryWorker:
             return False
         self._capture("verification", response.text)
         return is_enrolled(response.text)
+
+    def _login_form(self, html: str) -> bool:
+        """Detect the classic login form re-rendered where a real page was
+        expected. Every call site that can observe this (OPEN, SEARCH,
+        PREPARE, both verification queries) routes through here so the
+        session is marked unauthenticated the moment it's caught anywhere,
+        not just at the top of `_attempt`.
+        """
+        expired = _is_login_form_render(html)
+        if expired:
+            self._session.authenticated = False
+        return expired
 
     def _capture(self, label: str, html: str) -> None:
         """Diagnostic-only (SPEC §20): never changes a request or a classification.

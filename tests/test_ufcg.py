@@ -210,6 +210,22 @@ def test_login_is_reconstructed_with_a_fresh_get_and_action_each_call():
     assert get_count == 2
 
 
+def test_authenticated_flag_starts_false_and_flips_true_on_successful_login():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if request.method == "POST":
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if request.url.path == "/sigaa/portais/discente/discente.jsf":
+            return httpx.Response(200, text=_fixture("portal.html"))
+        raise AssertionError("unexpected GET")
+
+    session = _session(handler)
+    assert session.authenticated is False
+    session.login()
+    assert session.authenticated is True
+
+
 # --- get(): redirect validation, retry policy --------------------------------
 
 

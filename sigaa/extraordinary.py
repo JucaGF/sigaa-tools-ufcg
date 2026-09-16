@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -45,6 +44,7 @@ from .parsers.matricula_extraordinaria import (
     classify_message,
     confirmation_action,
     confirmation_identity_fields,
+    confirmation_target,
     is_enrolled,
     is_period_closed,
     menu_action,
@@ -526,14 +526,13 @@ def _is_available(target: ExtraordinaryClass) -> bool:
 
 
 def _confirmation_matches_target(html: str, target: ExtraordinaryClass) -> bool:
-    """SPEC §15 item 3: re-verify component + turma on the confirmation page
-    itself, textually (its exact DOM shape is unconfirmed by a real capture).
+    """SPEC §15 item 3 / capture 2026-09-16 §1.3: re-verify component + turma
+    against the confirmation page's own "Turmas Selecionadas" table -- never
+    a whole-page text scan. `confirmation_target` already fails closed
+    (returns ``None``) when that table shows anything other than exactly one
+    selected turma.
     """
-    normalized = " ".join(html.split())
-    if target.component_code not in normalized:
-        return False
-    class_pattern = re.compile(rf"turma\s*0*{re.escape(target.class_token)}\b", re.IGNORECASE)
-    return class_pattern.search(normalized) is not None
+    return confirmation_target(html) == (target.component_code, target.class_token)
 
 
 def retry_delay(header: str | None, failures: int, interval: float, now: float) -> float:

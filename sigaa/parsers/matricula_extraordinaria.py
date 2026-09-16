@@ -1,8 +1,12 @@
 """UFCG matrícula extraordinária: parse HTML/JSF, never do I/O or hold credentials.
 
-Only the primitives needed for login, session detection and the two known forms
-(menu, search) live here for now. Result parsing (`parse_classes`, selection,
-confirmation) is gated on a real capture and is not implemented yet.
+The login/menu/search forms, the results table + selection control, and the
+confirmation form/pre-send re-check are all verified against a real capture
+(SIGAA 4.20.6-ufcg.4, 2026-09-16; see
+docs/superpowers/specs/2026-09-15-ufcg-extraordinaria-capture.md and
+tests/fixtures/ufcg/results_real.html, confirmation_real.html). Only the
+post-confirmation verification ("meu vínculo") page remains an unverified
+hypothesis.
 """
 
 from __future__ import annotations
@@ -33,28 +37,29 @@ _PERIOD_CLOSED_TEXT = "matrícula extraordinária não está disponível no mome
 # Fixed selection target (SPEC §10.3): no fallback to another turma, ever.
 _TARGET_COMPONENT = "1109103"
 
-# Results-table header aliases -> canonical column key. Hypothesis pending a
-# real capture (see docs/superpowers/specs/2026-09-15-ufcg-extraordinaria-capture.md):
-# only the search *form* (form name="form", form:checkCodigo/txtCodigo/buscar)
-# is confirmed from a real UFCG render; the results table shape below is
-# derived from the UFPB regular-matrícula render of the same SIGAA family
-# (table class="formulario"), never a real UFCG extraordinária capture.
+# Results-table header -> canonical column key. Verified against a real
+# capture (2026-09-16): the header row is exactly
+# (blank) | Turma | Docente(s) | Tipo | Horário | Local | Capacidade | Vagas | (blank)
+# -- no aliases invented for a header that has never been observed.
 _RESULTS_HEADER_MAP = {
     "turma": "turma",
-    "código da turma": "turma",
     "horário": "horario",
-    "vagas": "vagas",
-    "vagas ofertadas": "vagas",
     "local": "local",
-    "sala": "local",
+    "vagas": "vagas",
 }
-_COMPONENT_HEADER_RE = re.compile(r"(\d{6,9})\s*-\s*(.+?)\s*\(([^)]+)\)")
-# Leading component code of a "<code> - <name>" cell, same extract-then-compare
-# approach as the results header above: a code that merely contains the
-# target as a substring (e.g. "21109103") must never match it.
+# Leading component code of a "<code> - <name>" cell/group header, e.g. the
+# real results group header "1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I" (no
+# trailing parenthetical, unlike the UFPB-derived hypothesis this replaces).
+# A code that merely contains the target as a substring (e.g. "21109103")
+# must never match it, hence the anchored start.
 _COMPONENT_CODE_RE = re.compile(r"^\s*(\d{6,9})")
 _VACANCY_RE = re.compile(r"(\d+)\s*vaga")
-_JSFCLJS_RE = re.compile(r"jsfcljs\(document\.forms\[['\"][^'\"]+['\"]\],\s*['\"]([^'\"]*)['\"]")
+# Real selection control (2026-09-16): an <a onclick="...jsfcljs(<elt>,{...},'')...">.
+# The second argument is a JS object literal {'name':'value', ...}, never the
+# 'k:v,k2:v2' string the previous (UFPB-derived) regex assumed -- that shape
+# never appears in a real render and is not matched here at all.
+_JSFCLJS_RE = re.compile(r"jsfcljs\([^,]+,\s*\{([^}]*)\}")
+_JSFCLJS_PAIR_RE = re.compile(r"""(['"])(?P<key>.*?)\1\s*:\s*(['"])(?P<value>.*?)\3""")
 
 # Verification-page header aliases -> canonical column key (same hypothesis
 # caveat as above: no real "meu vínculo" render has been captured yet).
@@ -348,6 +353,13 @@ def parse_classes(html: str) -> list[ExtraordinaryClass]:
     all (an unmodeled/unknown render -- the caller must fail closed, never
     guess). An empty list is returned when the table *is* recognized but no
     row matches anything (e.g. the searched component is simply absent).
+
+    The component code is not on the turma row: it is on a preceding group
+    header row (``tr.disciplina``, a single ``colspan`` cell reading
+    "<code> - <name>"), verified against a real capture 2026-09-16. Rows are
+    walked in document order, same technique as
+    ``sigaa/parsers/matricula.py::parse_open_turmas``, remembering the
+    current component and attaching it to the turma rows that follow.
     """
     soup = BeautifulSoup(html, "lxml")
     table = _find_results_table(soup)
@@ -358,13 +370,13 @@ def parse_classes(html: str) -> list[ExtraordinaryClass]:
     columns: dict[str, int] = {}
     results: list[ExtraordinaryClass] = []
     for row in table.find_all("tr"):
+        if "disciplina" in (row.get("class") or []):
+            match = _COMPONENT_CODE_RE.match(row.get_text(" ", strip=True))
+            if match:
+                component = match.group(1)
+            continue
         ths = row.find_all("th")
         if ths:
-            if len(ths) == 1 and ths[0].get("colspan"):
-                match = _COMPONENT_HEADER_RE.search(ths[0].get_text(" ", strip=True))
-                if match:
-                    component = match.group(1)
-                continue
             columns = {}
             for index, th in enumerate(ths):
                 key = _RESULTS_HEADER_MAP.get(_normalize_header(th.get_text(" ", strip=True)))
@@ -397,23 +409,26 @@ def _parse_vacancies(text: str | None) -> int | None:
     return int(stripped) if stripped.isdigit() else None
 
 
-def _parse_jsfcljs(href: str) -> tuple[tuple[str, str], ...]:
-    match = _JSFCLJS_RE.search(href)
+def _parse_jsfcljs(onclick: str) -> tuple[tuple[str, str], ...]:
+    """Parse ``jsfcljs(<elt>, {'name':'value', ...}, '')``'s object-literal
+    second argument, in source order. Real capture 2026-09-16: never execute
+    the JavaScript, just read the quoted pairs off the object literal.
+    """
+    match = _JSFCLJS_RE.search(onclick)
     if not match:
         return ()
-    pairs = []
-    for chunk in match.group(1).split(","):
-        if ":" not in chunk:
-            continue
-        key, value = chunk.split(":", 1)
-        pairs.append((key, value))
-    return tuple(pairs)
+    return tuple(
+        (pair.group("key"), pair.group("value")) for pair in _JSFCLJS_PAIR_RE.finditer(match.group(1))
+    )
 
 
 def _selection_fields_from_row(row: Tag) -> tuple[tuple[str, str], ...]:
-    link = row.find("a", href=re.compile(r"jsfcljs\("))
+    # The selection control is an <a onclick="...jsfcljs(...)...">; the
+    # "Ver detalhes" zoom.png link (onclick="PainelTurma.show(...)") never
+    # matches and must never be treated as a selection control.
+    link = row.find("a", onclick=re.compile(r"jsfcljs\("))
     if link is not None and link.get("disabled") is None:
-        pairs = _parse_jsfcljs(link["href"])
+        pairs = _parse_jsfcljs(link["onclick"])
         if pairs:
             return pairs
     button = row.find("input", attrs={"type": re.compile("^(submit|image)$", re.IGNORECASE), "name": True})
@@ -484,11 +499,17 @@ def _find_confirmation_form(soup: BeautifulSoup) -> Tag | None:
 
 
 def _find_birthdate_field(form: Tag, password_name: str) -> Tag | None:
+    """Real capture 2026-09-16: the field's own name/id is a generated JSF id
+    (``<form-id>:Data``) that never mentions "nascimento" -- only its
+    ``title`` attribute ("Data de Nascimento") does. Check name, id AND
+    title, same "locate it dynamically" contract as the password field.
+    """
     for node in form.select('input[type="date"], input[type="text"]'):
         name = node.get("name")
         if not name or name == password_name:
             continue
-        if _BIRTHDATE_HINT_RE.search(name) or _BIRTHDATE_HINT_RE.search(node.get("id") or ""):
+        haystack = " ".join(filter(None, [name, node.get("id"), node.get("title")]))
+        if _BIRTHDATE_HINT_RE.search(haystack):
             return node
     return None
 
@@ -564,6 +585,59 @@ def confirmation_action(html: str, url: str) -> FormAction:
     overrides.append((button["name"], button.get("value", "")))
     fields = build_form_payload(form, overrides)
     return FormAction(urljoin(url, form["action"]), tuple(fields))
+
+
+_SELECTED_HEADER_MAP = {"componente curricular": "componente", "turma": "turma"}
+
+
+def _find_selected_table(soup: BeautifulSoup) -> Tag | None:
+    for table in soup.find_all("table"):
+        caption = table.find("caption")
+        if caption and _normalize_header(caption.get_text(" ", strip=True)).startswith("turmas selecionadas"):
+            return table
+    return None
+
+
+def confirmation_target(html: str) -> tuple[str, str] | None:
+    """Capture 2026-09-16, §1.3: the pre-send re-check target.
+
+    The confirmation page's own ``table.listagem`` (caption "Turmas
+    Selecionadas (N)") is the sole source of truth for what SIGAA actually
+    prepared to enroll -- never the target the caller *asked* for. Returns
+    the sole selected turma's ``(component_code, class_token)``, or ``None``
+    when the table is missing/unrecognized, or shows anything other than
+    EXACTLY one selected turma: more than one is never trusted, per spec.
+    The following ``colspan`` docentes row is not a turma row and is skipped.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    table = _find_selected_table(soup)
+    if table is None:
+        return None
+    columns: dict[str, int] = {}
+    selected: list[tuple[str, str]] = []
+    for row in table.find_all("tr"):
+        ths = row.find_all("th")
+        if ths:
+            columns = {}
+            for index, th in enumerate(ths):
+                key = _SELECTED_HEADER_MAP.get(_normalize_header(th.get_text(" ", strip=True)))
+                if key is not None:
+                    columns[key] = index
+            continue
+        tds = row.find_all("td")
+        component_index, turma_index = columns.get("componente"), columns.get("turma")
+        if component_index is None or turma_index is None:
+            continue
+        if component_index >= len(tds) or turma_index >= len(tds):
+            continue
+        match = _COMPONENT_CODE_RE.match(tds[component_index].get_text(" ", strip=True))
+        if match is None:
+            continue
+        turma_text = tds[turma_index].get_text(" ", strip=True)
+        selected.append((match.group(1), normalize_class(turma_text)))
+    if len(selected) != 1:
+        return None
+    return selected[0]
 
 
 def is_enrolled(html: str) -> bool:

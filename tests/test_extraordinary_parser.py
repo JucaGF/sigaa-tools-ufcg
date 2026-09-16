@@ -11,6 +11,7 @@ from sigaa.parsers.matricula_extraordinaria import (
     classify_message,
     confirmation_action,
     confirmation_identity_fields,
+    confirmation_target,
     is_authenticated_portal,
     is_enrolled,
     is_period_closed,
@@ -274,26 +275,35 @@ def test_selection_has_no_class_one_fallback():
     assert select_target([row]) is None
 
 
-# --- parse_classes: real search form is confirmed, results table is a hypothesis ---
+# --- parse_classes: verified against a real capture, 2026-09-16 ------------
 
 
 def test_parse_classes_maps_headers_by_th_not_position():
-    rows = parse_classes(_fixture("results.html"))
-    assert len(rows) == 2
+    rows = parse_classes(_fixture("results_real.html"))
+    assert len(rows) == 3
     turma02 = next(r for r in rows if r.class_token == "2")
     assert turma02.component_code == "1109103"
     assert turma02.class_label == "Turma 02"
-    assert turma02.vacancies == 2
-    assert turma02.schedule_raw == "246810N34"
+    assert turma02.vacancies == 18
+    assert turma02.schedule_raw == "2T23 4T45 (08/09/2026 - 19/02/2027)"
     assert turma02.room == "CAA-202"
-    assert turma02.selection_fields == (("form:selecionarTurma_1", "postback-turma-02"),)
+    assert turma02.selection_fields == (
+        ("form:selecionarTurmaj_id_1", "form:selecionarTurmaj_id_1"),
+        ("idTurma", "100002"),
+    )
 
 
-def test_parse_classes_turma_without_vacancy_or_control_has_none_selection():
-    rows = parse_classes(_fixture("results.html"))
-    turma01 = next(r for r in rows if r.class_token == "1")
-    assert turma01.vacancies == 0
-    assert turma01.selection_fields == ()
+def test_parse_classes_all_three_real_rows_vacancies():
+    # The three real rows, by vacancy count -- also proves turma 01's own
+    # (real, non-zero) control is captured and never confused with turma 02's.
+    rows = {r.class_token: r for r in parse_classes(_fixture("results_real.html"))}
+    assert rows["1"].vacancies == 24
+    assert rows["1"].room == "CAA-204"
+    assert rows["2"].vacancies == 18
+    assert rows["3"].vacancies == 3
+    assert rows["3"].room == "CAA-403"
+    for row in rows.values():
+        assert row.selection_fields  # every real row has its own seta.gif control
 
 
 def test_parse_classes_raises_on_unrecognized_dom():
@@ -304,7 +314,7 @@ def test_parse_classes_raises_on_unrecognized_dom():
 def test_parse_classes_absent_values_are_none_not_zero():
     html = """
     <table class="formulario">
-      <tr><th colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr class="disciplina"><td colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td></tr>
       <tr><th>Turma</th><th>Vagas</th></tr>
       <tr><td>Turma 02</td><td>-</td></tr>
     </table>
@@ -313,12 +323,13 @@ def test_parse_classes_absent_values_are_none_not_zero():
     assert rows[0].vacancies is None
     assert rows[0].schedule_raw is None
     assert rows[0].room is None
+    assert rows[0].selection_fields == ()  # no control on this row at all
 
 
 def test_parse_classes_headers_reordered_still_map_correctly():
     html = """
     <table class="formulario">
-      <tr><th colspan="4">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr class="disciplina"><td colspan="4">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td></tr>
       <tr><th>Local</th><th>Vagas</th><th>Turma</th><th>Horário</th></tr>
       <tr><td>CAA-202</td><td>3 vagas</td><td>Turma 02</td><td>246810N34</td></tr>
     </table>
@@ -336,7 +347,7 @@ def test_parse_classes_component_absent_from_results_has_no_target():
     # select_target must find nothing for 1109103/02.
     html = """
     <table class="formulario">
-      <tr><th colspan="4">1108021 - PROGRAMAÇÃO I (DISCIPLINA)</th></tr>
+      <tr class="disciplina"><td colspan="4">1108021 - PROGRAMAÇÃO I</td></tr>
       <tr><th>Turma</th><th>Horário</th><th>Vagas</th><th>Local</th></tr>
       <tr><td>Turma 01</td><td>246810N12</td><td>5 vagas</td><td>CAA-100</td></tr>
     </table>
@@ -356,7 +367,7 @@ def test_parse_classes_recognized_table_with_zero_rows_is_empty():
 def test_parse_classes_only_turma_one_present():
     html = """
     <table class="formulario">
-      <tr><th colspan="4">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr class="disciplina"><td colspan="4">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td></tr>
       <tr><th>Turma</th><th>Horário</th><th>Vagas</th><th>Local</th></tr>
       <tr><td>Turma 01</td><td>246810N12</td><td>5 vagas</td><td>CAA-204</td></tr>
     </table>
@@ -366,23 +377,51 @@ def test_parse_classes_only_turma_one_present():
 
 
 def test_parse_classes_jsfcljs_link_selection_control():
+    # Real capture 2026-09-16: the second jsfcljs() argument is a JS object
+    # literal ({'name':'value',...}), read off an onclick attribute -- never
+    # the 'k:v,k2:v2' string / document.forms[...] href shape this replaces.
     html = """
     <table class="formulario">
-      <tr><th colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr class="disciplina"><td colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td></tr>
       <tr><th>Turma</th><th>Vagas</th></tr>
       <tr><td>Turma 02</td><td>1 vaga</td>
-        <td><a href="javascript:jsfcljs(document.forms['form'],'selecionar:2,k2:v2','')">Selecionar</a></td>
+        <td>
+          <a href="#" onclick="if(typeof jsfcljs == 'function'){jsfcljs(document.getElementById('form'),{'form:selecionarTurma':'form:selecionarTurma','idTurma':'100002'},'');}return false">
+            <img src="/sigaa/img/seta.gif" alt="Selecionar turma" />
+          </a>
+        </td>
       </tr>
     </table>
     """
     rows = parse_classes(html)
-    assert rows[0].selection_fields == (("selecionar", "2"), ("k2", "v2"))
+    assert rows[0].selection_fields == (
+        ("form:selecionarTurma", "form:selecionarTurma"),
+        ("idTurma", "100002"),
+    )
+
+
+def test_parse_classes_ignores_the_zoom_details_link_as_a_selection_control():
+    # The "Ver detalhes" zoom.png link's onclick never calls jsfcljs and must
+    # never be read as a selection control.
+    html = """
+    <table class="formulario">
+      <tr class="disciplina"><td colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td></tr>
+      <tr><th>Turma</th><th>Vagas</th></tr>
+      <tr><td>Turma 02</td><td>1 vaga</td>
+        <td><a href="javascript:void(0);" onclick="PainelTurma.show(100002);" title="Ver detalhes dessa turma">
+          <img src="/sigaa/img/graduacao/matriculas/zoom.png" alt="Ver detalhes da turma" />
+        </a></td>
+      </tr>
+    </table>
+    """
+    rows = parse_classes(html)
+    assert rows[0].selection_fields == ()
 
 
 def test_parse_classes_submit_button_selection_control():
     html = """
     <table class="formulario">
-      <tr><th colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr class="disciplina"><td colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td></tr>
       <tr><th>Turma</th><th>Vagas</th></tr>
       <tr><td>Turma 02</td><td>1 vaga</td>
         <td><input type="submit" name="form:selecionarTurma02" value="Selecionar"></td>
@@ -414,23 +453,25 @@ def test_select_target_requires_both_component_and_turma():
 
 
 def test_select_target_picks_the_positive_vacancy_row():
-    rows = parse_classes(_fixture("results.html"))
+    rows = parse_classes(_fixture("results_real.html"))
     target = select_target(rows)
     assert target is not None
     assert target.class_token == "2"
-    assert target.vacancies == 2
+    assert target.vacancies == 18
 
 
 # --- selection_action: rebuild from the row's own form ---------------------
 
 
 def test_selection_action_rebuilds_current_hidden_fields_plus_row_postback():
-    rows = parse_classes(_fixture("results.html"))
+    rows = parse_classes(_fixture("results_real.html"))
     target = select_target(rows)
-    action = selection_action(_fixture("results.html"), SEARCH_URL, target)
+    action = selection_action(_fixture("results_real.html"), SEARCH_URL, target)
     fields = dict(action.fields)
-    assert fields["javax.faces.ViewState"] == "render-fake-0003"
-    assert fields["form:selecionarTurma_1"] == "postback-turma-02"
+    assert fields["javax.faces.ViewState"] == "render-fake-0030"
+    # both pairs from the row's own jsfcljs control: its own name/value AND idTurma.
+    assert fields["form:selecionarTurmaj_id_1"] == "form:selecionarTurmaj_id_1"
+    assert fields["idTurma"] == "100002"
     assert action.action == SEARCH_URL
 
 
@@ -438,22 +479,25 @@ def test_selection_action_rebuilds_current_hidden_fields_plus_row_postback():
 
 
 def test_confirmation_identity_fields_are_located_dynamically_with_empty_values():
-    html = _fixture("confirmation.html")
+    html = _fixture("confirmation_real.html")
     names = confirmation_identity_fields(html)
-    assert names["password"] == "form:senha"
-    assert names["birth_date"] == "form:dataNascimento"
+    assert names["password"] == "j_id_jsp_000000000_1:senha"
+    assert names["birth_date"] == "j_id_jsp_000000000_1:Data"
     action = confirmation_action(html, SEARCH_URL)
     fields = dict(action.fields)
-    assert fields["form:senha"] == ""
-    assert fields["form:dataNascimento"] == ""
-    assert fields["javax.faces.ViewState"] == "render-fake-0004"
+    assert fields["j_id_jsp_000000000_1:senha"] == ""
+    assert fields["j_id_jsp_000000000_1:Data"] == ""
+    assert fields["javax.faces.ViewState"] == "render-fake-0021"
     # secrets are never stored here (values are always ""); simulate the
     # worker filling the real secret in later and confirm FormAction's
     # repr=False on `fields` still hides it (the previous assertion here was
     # vacuous: the sentinel it checked for never appeared anywhere).
     filled = FormAction(
         action.action,
-        tuple((name, "S3ntinelSecretValue") if name == "form:senha" else (name, value) for name, value in action.fields),
+        tuple(
+            (name, "S3ntinelSecretValue") if name == "j_id_jsp_000000000_1:senha" else (name, value)
+            for name, value in action.fields
+        ),
     )
     assert "S3ntinelSecretValue" not in repr(filled)
 
@@ -473,11 +517,14 @@ def test_confirmation_action_missing_entirely_fails_closed():
 
 
 def test_confirmation_action_includes_the_command_button():
-    action = confirmation_action(_fixture("confirmation.html"), SEARCH_URL)
+    action = confirmation_action(_fixture("confirmation_real.html"), SEARCH_URL)
     fields = dict(action.fields)
     # A JSF form posted without its submit/image parameter never invokes the
-    # action -- it just re-renders. Real button: name="form:confirmar".
-    assert fields["form:confirmar"] == "Confirmar Matrícula"
+    # action -- it just re-renders. Real button (2026-09-16 capture):
+    # "j_id_jsp_000000000_1:btnConfirmar" -- never btnRealizarNovaMatricula,
+    # the form's OTHER submit control (restarts the flow, does not confirm).
+    assert fields["j_id_jsp_000000000_1:btnConfirmar"] == "Confirmar Matrícula"
+    assert "j_id_jsp_000000000_1:btnRealizarNovaMatricula" not in fields
 
 
 def test_confirmation_action_without_a_command_button_fails_closed():
@@ -643,7 +690,37 @@ def test_selection_action_raises_when_row_has_no_recognized_control():
         vacancies=5, schedule_raw=None, room=None, selection_fields=(),
     )
     with pytest.raises(ValueError):
-        selection_action(_fixture("results.html"), SEARCH_URL, row)
+        selection_action(_fixture("results_real.html"), SEARCH_URL, row)
+
+
+# --- confirmation_target: the pre-send re-check (capture 2026-09-16 §1.3) ---
+
+
+def test_confirmation_target_reads_the_sole_selected_turma():
+    assert confirmation_target(_fixture("confirmation_real.html")) == ("1109103", "2")
+
+
+def test_confirmation_target_none_on_component_mismatch():
+    mismatched = _fixture("confirmation_real.html").replace("1109103", "9999999")
+    assert confirmation_target(mismatched) != ("1109103", "2")
+
+
+def test_confirmation_target_fails_closed_when_more_than_one_turma_selected():
+    html = """
+    <table class="listagem">
+      <caption>Turmas Selecionadas (2)</caption>
+      <thead><tr><th>Componente Curricular</th><th>Turma</th><th>Local</th></tr></thead>
+      <tbody>
+        <tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I - 60h</td><td>Turma 02</td><td>CAA-202</td></tr>
+        <tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I - 60h</td><td>Turma 03</td><td>CAA-403</td></tr>
+      </tbody>
+    </table>
+    """
+    assert confirmation_target(html) is None
+
+
+def test_confirmation_target_none_when_table_absent():
+    assert confirmation_target("<html><body>nothing here</body></html>") is None
 
 
 # --- classify_message: SPEC §22 categories, fixed diagnostics --------------

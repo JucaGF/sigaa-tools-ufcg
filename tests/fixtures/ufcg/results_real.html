@@ -1,0 +1,127 @@
+<!-- synthetic: sanitized from a real UFCG extraordinária results render captured
+     2026-09-16 (SIGAA 4.20.6-ufcg.4). Table structure, headers, cell formats and the
+     jsfcljs selection postback are verbatim; the student's identity, docentes, the
+     JSF ids and the ViewState are fake. -->
+<html>
+<body>
+<div id="conteudo">
+  <h2><a href="/sigaa/verPortalDiscente.do">Portal do Discente</a> &gt; Matrícula  Extraordinária</h2>
+
+  <div class="descricaoOperacao">
+    <p>Utilize o formulário abaixo para buscar por turmas que ainda possuem vagas remanescentes. Da lista de
+    resultados da busca, selecione uma turma para tentar se matricular clicando no ícone correspondente.</p>
+    <ol>
+      <li>Não é possível excluir ou cancelar turmas onde já está matriculado.</li>
+      <li>Caso passe em todas as verificações, você estará automaticamente MATRICULADO** na turma que selecionar.</li>
+    </ol>
+  </div>
+
+  <form id="form" name="form" method="post"
+        action="/sigaa/graduacao/matricula/extraordinaria/matricula_extraordinaria.jsf"
+        enctype="application/x-www-form-urlencoded">
+    <input type="hidden" name="form" value="form" />
+
+    <table class="formulario" width="90%">
+      <caption>Buscar Turmas com Vagas Remanescentes</caption>
+      <tbody>
+        <tr>
+          <td><input id="form:checkCodigo" type="checkbox" name="form:checkCodigo" checked="checked" class="noborder" /></td>
+          <td><label for="form:checkCodigo">Código do Componente:</label></td>
+          <td><input id="form:txtCodigo" type="text" name="form:txtCodigo" value="1109103" maxlength="10" size="10" /></td>
+        </tr>
+        <tr>
+          <td><input id="form:checkUnidade" type="checkbox" name="form:checkUnidade" class="noborder" /></td>
+          <td><label for="form:checkUnidade">Unidade Responsável:</label></td>
+          <td><select id="form:comboDepartamento" name="form:comboDepartamento" size="1" style="width: 400px">
+            <option value="0" selected="selected">-- SELECIONE --</option>
+            <option value="299">CCT - UNIDADE ACADEMICA DE MATEMATICA - CAMPINA GRANDE - CAMPINA GRANDE</option>
+          </select></td>
+        </tr>
+      </tbody>
+      <tfoot>
+        <tr><td colspan="3">
+          <input id="form:buscar" type="submit" name="form:buscar" value="Buscar" class="btn btn-primary" />
+          <input id="form:cancelar" type="submit" name="form:cancelar" value="Cancelar" />
+        </td></tr>
+      </tfoot>
+    </table>
+
+    <center><div class="infoAltRem">
+      <img src="/sigaa/img/graduacao/matriculas/zoom.png" />: Ver detalhes da turma
+      <img src="/sigaa/img/seta.gif" />: Selecionar turma
+    </div></center>
+
+    <table class="listagem" id="lista-turmas-extra">
+      <caption>Turmas Encontradas (3)</caption>
+      <thead>
+        <tr>
+          <th> </th>
+          <th> Turma </th>
+          <th> Docente(s) </th>
+          <th> Tipo </th>
+          <th> Horário </th>
+          <th> Local </th>
+          <th> Capacidade </th>
+          <th> Vagas </th>
+          <th style="width: 30px"> </th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="destaque no-hover disciplina ">
+          <td colspan="9" style="font-variant: small-caps;">
+            <a href="javascript:void(0);" onclick="PainelComponente.show(60);" title="Ver Detalhes do Componente Curricular">
+              1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I
+            </a>
+          </td>
+        </tr>
+
+        <tr class="linhaPar" id="turma_100001TR">
+          <td width="2%"><a href="javascript:void(0);" onclick="PainelTurma.show(100001);" title="Ver detalhes dessa turma"><img src="/sigaa/img/graduacao/matriculas/zoom.png" alt="Ver detalhes da turma" class="noborder" /></a></td>
+          <td width="8%">Turma 01</td>
+          <td>DOCENTE DE TESTE UM</td>
+          <td width="10%">REGULAR</td>
+          <td width="10%" class="small">2T23 4T45 (08/09/2026 - 19/02/2027)</td>
+          <td width="10%" class="small">CAA-204</td>
+          <td width="10%">80 alunos</td>
+          <td width="10%">24 vagas</td>
+          <td>
+            <a id="form:selecionarTurma" href="#" title="Selecionar turma" onclick="if(typeof jsfcljs == 'function'){jsfcljs(document.getElementById('form'),{'form:selecionarTurma':'form:selecionarTurma','idTurma':'100001'},'');}return false"><img src="/sigaa/img/seta.gif" alt="Selecionar turma" title="Selecionar turma" /></a>
+          </td>
+        </tr>
+
+        <tr class="linhaImpar" id="turma_100002TR">
+          <td width="2%"><a href="javascript:void(0);" onclick="PainelTurma.show(100002);" title="Ver detalhes dessa turma"><img src="/sigaa/img/graduacao/matriculas/zoom.png" alt="Ver detalhes da turma" class="noborder" /></a></td>
+          <td width="8%">Turma 02</td>
+          <td>DOCENTE DE TESTE DOIS</td>
+          <td width="10%">REGULAR</td>
+          <td width="10%" class="small">2T23 4T45 (08/09/2026 - 19/02/2027)</td>
+          <td width="10%" class="small">CAA-202</td>
+          <td width="10%">80 alunos</td>
+          <td width="10%">18 vagas</td>
+          <td>
+            <a id="form:selecionarTurmaj_id_1" href="#" title="Selecionar turma" onclick="if(typeof jsfcljs == 'function'){jsfcljs(document.getElementById('form'),{'form:selecionarTurmaj_id_1':'form:selecionarTurmaj_id_1','idTurma':'100002'},'');}return false"><img src="/sigaa/img/seta.gif" alt="Selecionar turma" title="Selecionar turma" /></a>
+          </td>
+        </tr>
+
+        <tr class="linhaPar" id="turma_100003TR">
+          <td width="2%"><a href="javascript:void(0);" onclick="PainelTurma.show(100003);" title="Ver detalhes dessa turma"><img src="/sigaa/img/graduacao/matriculas/zoom.png" alt="Ver detalhes da turma" class="noborder" /></a></td>
+          <td width="8%">Turma 03</td>
+          <td>DOCENTE DE TESTE TRES</td>
+          <td width="10%">REGULAR</td>
+          <td width="10%" class="small">2T23 4T45 (08/09/2026 - 19/02/2027)</td>
+          <td width="10%" class="small">CAA-403</td>
+          <td width="10%">70 alunos</td>
+          <td width="10%">3 vagas</td>
+          <td>
+            <a id="form:selecionarTurmaj_id_2" href="#" title="Selecionar turma" onclick="if(typeof jsfcljs == 'function'){jsfcljs(document.getElementById('form'),{'form:selecionarTurmaj_id_2':'form:selecionarTurmaj_id_2','idTurma':'100003'},'');}return false"><img src="/sigaa/img/seta.gif" alt="Selecionar turma" title="Selecionar turma" /></a>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <input type="hidden" name="javax.faces.ViewState" id="javax.faces.ViewState" value="render-fake-0030" />
+  </form>
+</div>
+<div id="rodape"><p>SIGAA | Copyright © 2006-2026 - UFRN - <a onclick="javascript:versao();">v4.20.6-ufcg.4</a></p></div>
+</body>
+</html>

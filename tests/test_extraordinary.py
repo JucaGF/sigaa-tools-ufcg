@@ -111,9 +111,9 @@ def _selection_and_confirmation_handler(
             extraordinaria_posts["n"] += 1
             n = extraordinaria_posts["n"]
             if n == 1:
-                return httpx.Response(200, text=results_html or _fixture("results.html"))
+                return httpx.Response(200, text=results_html or _fixture("results_real.html"))
             if n == 2:
-                return httpx.Response(200, text=confirmation_html or _fixture("confirmation.html"))
+                return httpx.Response(200, text=confirmation_html or _fixture("confirmation_real.html"))
             if n == 3:
                 state["confirmation_posts"] += 1
                 if confirmation_raises:
@@ -1004,8 +1004,8 @@ def test_confirm_fields_are_filled_from_secrets_not_stored_on_the_parser_object(
         and r.url.path.split(";")[0].startswith("/sigaa/graduacao/matricula/extraordinaria/")
     ]
     body = _body(confirmation_posts[2])
-    assert body["form:senha"] == "s3cr3t-pw"
-    assert body["form:dataNascimento"] == "01/02/2003"
+    assert body["j_id_jsp_000000000_1:senha"] == "s3cr3t-pw"
+    assert body["j_id_jsp_000000000_1:Data"] == "01/02/2003"
 
 
 # --- the required scenario: a timeout inside the confirmation POST ----------
@@ -1164,9 +1164,9 @@ def test_verify_falls_back_to_read_only_search_after_first_inconclusive_portal_q
             extraordinaria_posts["n"] += 1
             n = extraordinaria_posts["n"]
             if n == 1:
-                return httpx.Response(200, text=_fixture("results.html"))
+                return httpx.Response(200, text=_fixture("results_real.html"))
             if n == 2:
-                return httpx.Response(200, text=_fixture("confirmation.html"))
+                return httpx.Response(200, text=_fixture("confirmation_real.html"))
             if n == 3:
                 return httpx.Response(200, text="<html><body>processing</body></html>")
             if n == 4:
@@ -1215,9 +1215,9 @@ def test_session_bounce_during_verification_relogins_and_retries_only_verificati
             extraordinaria_posts["n"] += 1
             n = extraordinaria_posts["n"]
             if n == 1:
-                return httpx.Response(200, text=_fixture("results.html"))
+                return httpx.Response(200, text=_fixture("results_real.html"))
             if n == 2:
-                return httpx.Response(200, text=_fixture("confirmation.html"))
+                return httpx.Response(200, text=_fixture("confirmation_real.html"))
             if n == 3:
                 return httpx.Response(200, text="<html><body>processing</body></html>")
             raise AssertionError("unexpected extra POST to the extraordinária endpoint")
@@ -1318,7 +1318,7 @@ def test_prepare_fails_closed_when_confirmation_form_has_no_password_field():
 
 
 def test_prepare_fails_closed_when_confirmation_page_does_not_match_target():
-    mismatched = _fixture("confirmation.html").replace("1109103", "9999999")
+    mismatched = _fixture("confirmation_real.html").replace("1109103", "9999999")
     handler, _ = _selection_and_confirmation_handler(confirmation_html=mismatched)
     worker, _ = _worker(handler)
     result = worker.run()
@@ -1333,7 +1333,7 @@ def test_prepare_fails_closed_when_confirmation_page_does_not_match_target():
 def test_worker_ambiguous_target_rows_is_a_fatal_error():
     ambiguous = """
     <table class="formulario">
-      <tr><th colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr class="disciplina"><td colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td></tr>
       <tr><th>Turma</th><th>Vagas</th></tr>
       <tr><td>Turma 02</td><td>1 vaga</td><td><input type="submit" name="form:sel1" value="Selecionar"></td></tr>
       <tr><td>Turma 02</td><td>1 vaga</td><td><input type="submit" name="form:sel2" value="Selecionar"></td></tr>
@@ -1380,7 +1380,7 @@ def test_is_available_false_on_explicit_zero_even_with_a_stray_control():
 def test_watch_polls_on_no_vacancy():
     no_vacancy = """
     <table class="formulario">
-      <tr><th colspan="4">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr class="disciplina"><td colspan="4">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td></tr>
       <tr><th>Turma</th><th>Horário</th><th>Vagas</th><th>Local</th></tr>
       <tr><td>Turma 02</td><td>246810N34</td><td>0 vaga</td><td>CAA-202</td></tr>
     </table>
@@ -1515,7 +1515,7 @@ def test_run_treats_a_search_payload_validation_error_as_terminal(fixture_name):
 def test_watch_polls_on_target_not_found():
     absent = """
     <table class="formulario">
-      <tr><th colspan="4">1108021 - PROGRAMAÇÃO I (DISCIPLINA)</th></tr>
+      <tr class="disciplina"><td colspan="4">1108021 - PROGRAMAÇÃO I</td></tr>
       <tr><th>Turma</th><th>Horário</th><th>Vagas</th><th>Local</th></tr>
       <tr><td>Turma 01</td><td>246810N12</td><td>5 vagas</td><td>CAA-100</td></tr>
     </table>

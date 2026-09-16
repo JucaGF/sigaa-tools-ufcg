@@ -334,6 +334,23 @@ def _normalize_header(text: str) -> str:
     return collapsed.casefold()
 
 
+def _map_header_columns(row: Tag, header_map: dict[str, str]) -> dict[str, int] | None:
+    """When ``row`` has ``<th>`` cells, map each recognized header to its column
+    index via ``header_map`` (keyed by normalized header text). Returns
+    ``None`` for a non-header row, so callers can tell "reset the mapping"
+    apart from "this header row recognized nothing" (an empty dict).
+    """
+    ths = row.find_all("th")
+    if not ths:
+        return None
+    columns: dict[str, int] = {}
+    for index, th in enumerate(ths):
+        key = header_map.get(_normalize_header(th.get_text(" ", strip=True)))
+        if key is not None:
+            columns[key] = index
+    return columns
+
+
 def _find_results_table(soup: BeautifulSoup) -> Tag | None:
     table = soup.find("table", id=re.compile(r"resultado|turmas", re.IGNORECASE))
     if table is not None:
@@ -375,13 +392,9 @@ def parse_classes(html: str) -> list[ExtraordinaryClass]:
             if match:
                 component = match.group(1)
             continue
-        ths = row.find_all("th")
-        if ths:
-            columns = {}
-            for index, th in enumerate(ths):
-                key = _RESULTS_HEADER_MAP.get(_normalize_header(th.get_text(" ", strip=True)))
-                if key is not None:
-                    columns[key] = index
+        header_columns = _map_header_columns(row, _RESULTS_HEADER_MAP)
+        if header_columns is not None:
+            columns = header_columns
             continue
         tds = row.find_all("td")
         if not tds or not columns or component is None:
@@ -492,8 +505,16 @@ def selection_action(html: str, url: str, row: ExtraordinaryClass) -> FormAction
 
 
 def _find_confirmation_form(soup: BeautifulSoup) -> Tag | None:
-    for form in soup.find_all("form"):
-        if form.select_one('input[type="password"][name]') is not None:
+    """Capture doc §1: locate the confirmation form by its ``action`` ending in
+    ``confirmacao.jsf`` -- "nunca pelo nome", and, by the same contract, never
+    by "first form with a password input" either (an unrelated widget, e.g. a
+    "trocar senha" form, could carry one too). The password check stays a
+    secondary sanity assertion, done by `_identity_fields` once the form is
+    located here: a real render of this page always has one, so its absence
+    means the action-based match landed on the wrong element.
+    """
+    for form in soup.find_all("form", action=True):
+        if urlparse(form["action"]).path.endswith("confirmacao.jsf"):
             return form
     return None
 
@@ -503,15 +524,23 @@ def _find_birthdate_field(form: Tag, password_name: str) -> Tag | None:
     (``<form-id>:Data``) that never mentions "nascimento" -- only its
     ``title`` attribute ("Data de Nascimento") does. Check name, id AND
     title, same "locate it dynamically" contract as the password field.
+
+    Same fail-closed contract as `_find_confirmation_button`: adding `title`
+    to the matching surface makes an accidental second match more likely, so
+    more than one candidate is never resolved by picking the first -- it
+    raises instead of guessing which field is the real one.
     """
+    candidates = []
     for node in form.select('input[type="date"], input[type="text"]'):
         name = node.get("name")
         if not name or name == password_name:
             continue
         haystack = " ".join(filter(None, [name, node.get("id"), node.get("title")]))
         if _BIRTHDATE_HINT_RE.search(haystack):
-            return node
-    return None
+            candidates.append(node)
+    if len(candidates) > 1:
+        raise ValueError("extraordinária confirmation form has more than one candidate birth-date field")
+    return candidates[0] if candidates else None
 
 
 def _identity_fields(html: str) -> tuple[Tag, dict[str, str]]:
@@ -616,13 +645,9 @@ def confirmation_target(html: str) -> tuple[str, str] | None:
     columns: dict[str, int] = {}
     selected: list[tuple[str, str]] = []
     for row in table.find_all("tr"):
-        ths = row.find_all("th")
-        if ths:
-            columns = {}
-            for index, th in enumerate(ths):
-                key = _SELECTED_HEADER_MAP.get(_normalize_header(th.get_text(" ", strip=True)))
-                if key is not None:
-                    columns[key] = index
+        header_columns = _map_header_columns(row, _SELECTED_HEADER_MAP)
+        if header_columns is not None:
+            columns = header_columns
             continue
         tds = row.find_all("td")
         component_index, turma_index = columns.get("componente"), columns.get("turma")
@@ -651,13 +676,9 @@ def is_enrolled(html: str) -> bool:
     for table in soup.find_all("table"):
         columns: dict[str, int] = {}
         for row in table.find_all("tr"):
-            ths = row.find_all("th")
-            if ths:
-                columns = {}
-                for index, th in enumerate(ths):
-                    key = _STATUS_HEADER_MAP.get(_normalize_header(th.get_text(" ", strip=True)))
-                    if key is not None:
-                        columns[key] = index
+            header_columns = _map_header_columns(row, _STATUS_HEADER_MAP)
+            if header_columns is not None:
+                columns = header_columns
                 continue
             if not columns:
                 continue

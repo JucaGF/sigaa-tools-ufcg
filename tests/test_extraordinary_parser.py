@@ -508,9 +508,67 @@ def test_confirmation_action_without_password_field_fails_closed():
         confirmation_action(html, SEARCH_URL)
 
 
+# --- confirmation_identity_fields: birth-date field must fail closed on ambiguity
+
+
+_CONFIRMATION_ACTION = "/sigaa/graduacao/matricula/extraordinaria/confirmacao.jsf"
+
+
+def test_confirmation_identity_fields_single_birthdate_candidate_is_used():
+    html = (
+        f"<html><body><form name='form' action='{_CONFIRMATION_ACTION}'>"
+        "<input type='hidden' name='javax.faces.ViewState' value='x'>"
+        "<input type='text' name='form:Data' title='Data de Nascimento'>"
+        "<input type='password' name='form:senha'>"
+        "</form></body></html>"
+    )
+    names = confirmation_identity_fields(html)
+    assert names["birth_date"] == "form:Data"
+
+
+def test_confirmation_identity_fields_ambiguous_birthdate_field_fails_closed():
+    # Two candidates both matching the nasc|birth hint: no rule picks a
+    # winner, same fail-closed contract as `_find_confirmation_button`.
+    html = (
+        f"<html><body><form name='form' action='{_CONFIRMATION_ACTION}'>"
+        "<input type='hidden' name='javax.faces.ViewState' value='x'>"
+        "<input type='text' name='form:Data' title='Data de Nascimento'>"
+        "<input type='text' name='form:birthDateConfirm' title='Confirme a data de nascimento'>"
+        "<input type='password' name='form:senha'>"
+        "</form></body></html>"
+    )
+    with pytest.raises(ValueError):
+        confirmation_identity_fields(html)
+
+
 def test_confirmation_action_missing_entirely_fails_closed():
     with pytest.raises(ValueError):
         confirmation_action("<html><body>nothing here</body></html>", SEARCH_URL)
+
+
+def test_confirmation_form_is_located_by_action_not_by_first_password_field():
+    # Capture doc §1: locate the confirmation form by its `action` ending in
+    # confirmacao.jsf, "nunca pelo nome" -- and, per the same contract, never
+    # by "first form with a password input" either. An unrelated widget (e.g.
+    # a "trocar senha" form) with its own password field, rendered BEFORE the
+    # real confirmation form, must not be mistaken for it.
+    html = (
+        "<html><body>"
+        "<form name='trocarSenha' action='/sigaa/comum/trocarSenha.jsf'>"
+        "<input type='password' name='novaSenha' value=''>"
+        "</form>"
+        f"<form name='form' action='{_CONFIRMATION_ACTION}'>"
+        "<input type='hidden' name='javax.faces.ViewState' value='render-real'>"
+        "<input type='password' name='form:senha' value=''>"
+        "<input type='submit' name='form:confirmar' value='Confirmar Matrícula'>"
+        "</form>"
+        "</body></html>"
+    )
+    action = confirmation_action(html, SEARCH_URL)
+    fields = dict(action.fields)
+    assert fields["javax.faces.ViewState"] == "render-real"
+    assert fields["form:confirmar"] == "Confirmar Matrícula"
+    assert "novaSenha" not in fields
 
 
 # --- round 2 review fix #1: the command button must be in the payload ------
@@ -529,7 +587,7 @@ def test_confirmation_action_includes_the_command_button():
 
 def test_confirmation_action_without_a_command_button_fails_closed():
     html = (
-        "<html><body><form name='form'>"
+        f"<html><body><form name='form' action='{_CONFIRMATION_ACTION}'>"
         "<input type='hidden' name='javax.faces.ViewState' value='x'>"
         "<input type='password' name='form:senha' value=''>"
         "</form></body></html>"
@@ -543,7 +601,7 @@ def test_confirmation_action_skips_a_cancel_button_rendered_before_confirm():
     # document order, which posts Cancelar (with `prepared.sent` already
     # True) if the real form ever renders it before Confirmar.
     html = (
-        "<html><body><form name='form' action='/x'>"
+        f"<html><body><form name='form' action='{_CONFIRMATION_ACTION}'>"
         "<input type='hidden' name='javax.faces.ViewState' value='x'>"
         "<input type='password' name='form:senha' value=''>"
         "<input type='submit' name='form:cancelar' value='Cancelar'>"
@@ -560,7 +618,7 @@ def test_confirmation_action_ambiguous_buttons_fail_closed():
     # Two submit controls, neither reading as "confirm" nor "cancel"/"voltar":
     # no rule picks a winner, so this must fail closed rather than guess.
     html = (
-        "<html><body><form name='form' action='/x'>"
+        f"<html><body><form name='form' action='{_CONFIRMATION_ACTION}'>"
         "<input type='hidden' name='javax.faces.ViewState' value='x'>"
         "<input type='password' name='form:senha' value=''>"
         "<input type='submit' name='form:btn1' value='OK'>"

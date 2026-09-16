@@ -65,6 +65,9 @@ _STATUS_HEADER_MAP = {
     "semestre": "periodo",
 }
 _TARGET_SEMESTER = "2026.2"
+# Word-boundary match so "desmatriculado" (a real, distinct negative status)
+# never reads as proof: "matriculado" is a substring of it but never a word.
+_ENROLLED_STATUS_RE = re.compile(r"\bmatriculado\b", re.IGNORECASE)
 
 # SPEC §22 message categories: fixed diagnostics, the raw body is never echoed.
 _UNKNOWN_RESPONSE = "resposta desconhecida"
@@ -419,6 +422,13 @@ def select_target(rows: list[ExtraordinaryClass]) -> ExtraordinaryClass | None:
 
 
 def selection_action(html: str, url: str, row: ExtraordinaryClass) -> FormAction:
+    """Round-2 review fix: an empty ``selection_fields`` means no recognized
+    control was found for this row (SPEC §13's "trustworthy enabled
+    selection control" requirement) -- posting without it can't express
+    which row was chosen, so this fails closed before touching the DOM.
+    """
+    if not row.selection_fields:
+        raise ValueError("extraordinária target row has no recognized selection control")
     soup = BeautifulSoup(html, "lxml")
     form = soup.find("form", attrs={"name": "form"})
     if form is None:
@@ -467,9 +477,19 @@ def confirmation_identity_fields(html: str) -> dict[str, str]:
 
 
 def confirmation_action(html: str, url: str) -> FormAction:
+    """Round-2 review fix: a JSF form posted without its command-button
+    parameter never invokes the action (it just re-renders) -- the button
+    is located and added exactly as `search_action` does for `form:buscar`.
+    Fails closed (`ValueError`) when no submit/image control is found, same
+    as a missing password field.
+    """
     form, names = _identity_fields(html)
     _require_viewstate(form.select('input[type="hidden"][name]'), "extraordinária confirmation form")
+    button = form.find(attrs={"type": re.compile("^(submit|image)$", re.IGNORECASE), "name": True})
+    if button is None:
+        raise ValueError("extraordinária confirmation form has no submit/image command button")
     overrides = [(name, "") for name in names.values()]
+    overrides.append((button["name"], button.get("value", "")))
     fields = build_form_payload(form, overrides)
     return FormAction(urljoin(url, form["action"]), tuple(fields))
 
@@ -516,22 +536,38 @@ def _row_shows_enrollment(tds: list[Tag], columns: dict[str, int], target_token:
     if normalize_class(turma_text) != target_token:
         return False
     status_text = _normalize_header(tds[status_index].get_text(" ", strip=True))
-    if "não matriculado" in status_text or "matriculado" not in status_text:
+    if "não matriculado" in status_text or "nao matriculado" in status_text:
         return False
+    # word-boundary match: "matriculado" must appear as its own word, not as
+    # a substring of e.g. "desmatriculado" (a real, distinct negative status).
+    if not _ENROLLED_STATUS_RE.search(status_text):
+        return False
+    # Fail closed: a verification table with no Período/Semestre column at
+    # all can never prove the *current* semester, so it is never proof.
     period_index = columns.get("periodo")
-    if period_index is not None and period_index < len(tds):
-        period_text = tds[period_index].get_text(" ", strip=True)
-        if period_text and period_text != _TARGET_SEMESTER:
-            return False
+    if period_index is None or period_index >= len(tds):
+        return False
+    period_text = tds[period_index].get_text(" ", strip=True)
+    if period_text != _TARGET_SEMESTER:
+        return False
     return True
 
 
 def classify_message(html: str) -> str:
-    """SPEC §22: a fixed diagnostic category, never the raw sanitized text."""
+    """SPEC §22: a fixed diagnostic category, never the raw sanitized text.
+
+    Classifies ONLY the text inside SIGAA's own message panels
+    (`_MESSAGE_SELECTOR`) -- never the whole page. A real UFCG extraordinária
+    SEARCH page's instructional prose (outside any message panel, in a
+    `div.descricaoOperacao`) contains "já está matriculado", "choque de
+    horários" and the literal word "MATRICULADO", none of which are an
+    actual SIGAA message; scanning the whole document previously
+    misclassified that ordinary page as "já matriculado" on every render.
+    No recognized message panel -> `resposta desconhecida`, never a body-text
+    guess.
+    """
     soup = BeautifulSoup(html, "lxml")
     texts = [_normalize_header(node.get_text(" ", strip=True)) for node in soup.select(_MESSAGE_SELECTOR)]
-    if not texts:
-        texts = [_normalize_header(soup.get_text(" ", strip=True))]
     for text in texts:
         for category, needles in _MESSAGE_CATEGORIES:
             if any(_normalize_header(needle) in text for needle in needles):

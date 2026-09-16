@@ -177,6 +177,18 @@ def test_capture_dir_non_empty_returns_five_before_any_session(tmp_path, monkeyp
     assert not flag["called"]
 
 
+def test_capture_pointing_at_a_regular_file_returns_five_not_a_traceback(tmp_path, monkeypatch):
+    # Round-2 review fix: path.exists() and any(path.iterdir()) raised an
+    # uncaught NotADirectoryError when --capture pointed at a regular file.
+    _never_open_session(monkeypatch)
+    flag = _never_touch_keyring(monkeypatch)
+    capture_path = tmp_path / "not-a-directory"
+    capture_path.write_text("hello", encoding="utf-8")
+    args = _parse("--codigo", "1109103", "--turma", "02", "--capture", str(capture_path))
+    assert cli_module._cmd_matricula_extraordinaria(args, None) == 5  # must not raise
+    assert not flag["called"]
+
+
 def test_capture_dir_empty_or_absent_is_accepted(tmp_path, monkeypatch):
     monkeypatch.setitem(
         sys.modules,

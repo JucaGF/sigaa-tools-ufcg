@@ -424,8 +424,15 @@ def test_confirmation_identity_fields_are_located_dynamically_with_empty_values(
     assert fields["form:senha"] == ""
     assert fields["form:dataNascimento"] == ""
     assert fields["javax.faces.ViewState"] == "render-fake-0004"
-    # secrets are never stored: FormAction repr never includes field values
-    assert "senha" not in repr(action) or "topsecret" not in repr(action)
+    # secrets are never stored here (values are always ""); simulate the
+    # worker filling the real secret in later and confirm FormAction's
+    # repr=False on `fields` still hides it (the previous assertion here was
+    # vacuous: the sentinel it checked for never appeared anywhere).
+    filled = FormAction(
+        action.action,
+        tuple((name, "S3ntinelSecretValue") if name == "form:senha" else (name, value) for name, value in action.fields),
+    )
+    assert "S3ntinelSecretValue" not in repr(filled)
 
 
 def test_confirmation_action_without_password_field_fails_closed():
@@ -437,6 +444,28 @@ def test_confirmation_action_without_password_field_fails_closed():
 def test_confirmation_action_missing_entirely_fails_closed():
     with pytest.raises(ValueError):
         confirmation_action("<html><body>nothing here</body></html>", SEARCH_URL)
+
+
+# --- round 2 review fix #1: the command button must be in the payload ------
+
+
+def test_confirmation_action_includes_the_command_button():
+    action = confirmation_action(_fixture("confirmation.html"), SEARCH_URL)
+    fields = dict(action.fields)
+    # A JSF form posted without its submit/image parameter never invokes the
+    # action -- it just re-renders. Real button: name="form:confirmar".
+    assert fields["form:confirmar"] == "Confirmar Matrícula"
+
+
+def test_confirmation_action_without_a_command_button_fails_closed():
+    html = (
+        "<html><body><form name='form'>"
+        "<input type='hidden' name='javax.faces.ViewState' value='x'>"
+        "<input type='password' name='form:senha' value=''>"
+        "</form></body></html>"
+    )
+    with pytest.raises(ValueError):
+        confirmation_action(html, SEARCH_URL)
 
 
 # --- is_enrolled: same row, same semester -----------------------------------
@@ -491,6 +520,63 @@ def test_is_enrolled_false_on_historical_semester():
     assert is_enrolled(html) is False
 
 
+# --- round 2 review fix #3: no Período column at all must fail closed ------
+
+
+def test_is_enrolled_false_when_the_table_has_no_period_column_at_all():
+    # The old code only rejected a *present-but-mismatched* Período; a table
+    # missing the column entirely fell through to True (fail open). A table
+    # with no semester column can never prove the *current* semester.
+    html = """
+    <table class="formulario">
+      <tr><th>Componente</th><th>Turma</th><th>Situação</th></tr>
+      <tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td><td>02</td><td>MATRICULADO</td></tr>
+    </table>
+    """
+    assert is_enrolled(html) is False
+
+
+# --- round 2 review fix #4: "matriculado" must be a whole word -------------
+
+
+def test_is_enrolled_false_on_desmatriculado_substring():
+    html = """
+    <table class="formulario">
+      <tr><th>Componente</th><th>Turma</th><th>Situação</th><th>Período</th></tr>
+      <tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td><td>02</td><td>DESMATRICULADO</td><td>2026.2</td></tr>
+    </table>
+    """
+    assert is_enrolled(html) is False
+
+
+def test_is_enrolled_false_on_nao_matriculado_still_rejected():
+    html = """
+    <table class="formulario">
+      <tr><th>Componente</th><th>Turma</th><th>Situação</th><th>Período</th></tr>
+      <tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td><td>02</td><td>NÃO MATRICULADO</td><td>2026.2</td></tr>
+    </table>
+    """
+    assert is_enrolled(html) is False
+
+
+def test_is_enrolled_true_still_holds_for_the_plain_positive_case():
+    # Regression guard: the word-boundary + fail-closed-semester changes must
+    # not break the ordinary positive case.
+    assert is_enrolled(_fixture("enrolled.html")) is True
+
+
+# --- round 2 review fix #5: no recognized control -> fail closed, never post ---
+
+
+def test_selection_action_raises_when_row_has_no_recognized_control():
+    row = ExtraordinaryClass(
+        component_code="1109103", class_token="2", class_label="Turma 02",
+        vacancies=5, schedule_raw=None, room=None, selection_fields=(),
+    )
+    with pytest.raises(ValueError):
+        selection_action(_fixture("results.html"), SEARCH_URL, row)
+
+
 # --- classify_message: SPEC §22 categories, fixed diagnostics --------------
 
 
@@ -519,3 +605,36 @@ def test_classify_message_unknown_never_echoes_the_body():
     result = classify_message(html)
     assert result == "resposta desconhecida"
     assert "inesperado" not in result
+
+
+# --- fix round 1: classify_message/is_enrolled must never read whole-page
+# text, only SIGAA's own message panels / the same table row (SPEC §22, §16).
+# Regression fixtures reproduce real UFCG extraordinária SEARCH-page prose
+# (div.descricaoOperacao) that contains "já está matriculado", "choque de
+# horários" and the literal word "MATRICULADO" outside any message panel or
+# bond table -- a real render, per capture 0003-search.html, 2026-09-15.
+
+
+def test_classify_message_ignores_instructional_prose_outside_message_panels():
+    html = _fixture("search_with_instructions.html")
+    # the prose contains "já está matriculado" and "choque de horários": a
+    # whole-page-text scan used to misclassify this ordinary search page.
+    assert classify_message(html) != "já matriculado"
+    assert classify_message(html) != "choque de horário"
+    assert classify_message(html) == "resposta desconhecida"  # no message panel exists on this page
+
+
+def test_is_enrolled_false_on_a_page_with_only_instructional_prose_no_table():
+    assert is_enrolled(_fixture("search_with_instructions.html")) is False
+
+
+def test_is_enrolled_ignores_the_literal_word_matriculado_outside_the_bond_row():
+    # A page with a genuine bond table AND the instructional prose elsewhere:
+    # the target's own row (1109103/02/MATRICULADO/2026.2) is still proof.
+    assert is_enrolled(_fixture("enrolled_with_instructional_prose.html")) is True
+
+
+def test_is_enrolled_false_when_prose_present_but_no_matching_bond_row():
+    # Same prose, but the only table row is for a different component/turma:
+    # the prose's stray "MATRICULADO" must never substitute for a real row.
+    assert is_enrolled(_fixture("not_enrolled_with_instructional_prose.html")) is False

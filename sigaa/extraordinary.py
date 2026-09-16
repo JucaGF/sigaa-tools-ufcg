@@ -342,40 +342,51 @@ class ExtraordinaryWorker:
         # from here: only the verification query and its own recovery -- a
         # 30x, a timeout or an unexpected status all fall through the same way.
 
-        category = None
-        if response is not None and 200 <= response.status_code < 300:
+        confirmation_ok = response is not None and 200 <= response.status_code < 300
+        if confirmation_ok:
             self._capture("confirmation-result", response.text)
-            category = classify_message(response.text)
-            if category in _TERMINAL_REJECTION_CATEGORIES:
-                _log("REJECTED", reason=category)
-                return RunResult("rejected", category, 3)
 
+        # Round-2 review fix: verification runs BEFORE any rejection is
+        # trusted. `classify_message` only reads SIGAA's own message panels
+        # (round-1 fix), but a genuine panel on a post-confirmation render
+        # can still legitimately mention e.g. "sem vaga" for an unrelated
+        # turma while THIS confirmation actually succeeded -- and reporting
+        # a false "rejected" invites a human to re-run with --confirm, i.e.
+        # exactly the double-send this whole design exists to prevent. A
+        # proven bond always wins over any message-based classification.
         result = self._verify(prepared.target)
-        if category == "já matriculado" and result.status == "enrolled":
-            # A message alone is never enough (contracts.md); this is the
-            # same independent proof that also grants plain "enrolled".
-            return RunResult("already_enrolled", result.message, 0)
+        category = classify_message(response.text) if confirmation_ok else None
+
+        if result.status == "enrolled":
+            if category == "já matriculado":
+                # A message alone is never enough (contracts.md); this is the
+                # same independent proof that also grants plain "enrolled".
+                return RunResult("already_enrolled", result.message, 0)
+            return result
+
+        if category in _TERMINAL_REJECTION_CATEGORIES:
+            _log("REJECTED", reason=category)
+            return RunResult("rejected", category, 3)
+
         return result
 
     def _verify(self, target: ExtraordinaryClass) -> RunResult:
         """SPEC §16: read-only, independent, at most 3 queries with backoff.
 
-        A session bounce mid-verification re-logins and retries the SAME
-        verification query -- it never reconstructs or resends a confirmation.
+        The first query reads the authenticated portal; SPEC §16's second
+        read-only candidate (re-open + re-search the extraordinária) is used
+        for every query after that, so an inconclusive portal read is never
+        just asked again verbatim. A session bounce mid-verification
+        re-logins and retries the SAME verification query -- it never
+        reconstructs or resends a confirmation.
         """
         del target  # is_enrolled() checks the one fixed product target itself.
         query = 0
         guard = 0
         while query < _MAX_VERIFICATION_QUERIES and guard < _MAX_VERIFICATION_QUERIES + 3:
             guard += 1
-            try:
-                response = self._session.get(PORTAL_URL)
-            except UFCGError:
-                query += 1
-                if query < _MAX_VERIFICATION_QUERIES:
-                    self._sleep(_VERIFICATION_BACKOFF[min(query - 1, len(_VERIFICATION_BACKOFF) - 1)])
-                continue
-            if _is_login_form_render(response.text):
+            outcome = self._verify_via_portal() if query == 0 else self._verify_via_search()
+            if outcome is _SESSION_EXPIRED:
                 try:
                     self._session.login()
                 except UFCGError:
@@ -383,14 +394,46 @@ class ExtraordinaryWorker:
                 continue  # retry the same verification query, no query consumed
             query += 1
             _log("VERIFYING", attempt=query)
-            self._capture("verification", response.text)
-            if is_enrolled(response.text):
+            if outcome:
                 _log("ENROLLED")
                 return RunResult("enrolled", _ENROLLED_MESSAGE, 0)
             if query < _MAX_VERIFICATION_QUERIES:
                 self._sleep(_VERIFICATION_BACKOFF[min(query - 1, len(_VERIFICATION_BACKOFF) - 1)])
         _log("UNKNOWN")
         return RunResult("unknown", _UNKNOWN_MESSAGE, 4)
+
+    def _verify_via_portal(self) -> bool | object:
+        """SPEC §16 candidate 1: the authenticated portal listing."""
+        try:
+            response = self._session.get(PORTAL_URL)
+        except UFCGError:
+            return False  # transient: this query is inconclusive, not proof either way
+        if _is_login_form_render(response.text):
+            return _SESSION_EXPIRED
+        self._capture("verification", response.text)
+        return is_enrolled(response.text)
+
+    def _verify_via_search(self) -> bool | object:
+        """SPEC §16 candidate 2: re-open the extraordinária and re-search the
+        component, read-only, reusing the same `_open` the main flow uses.
+        """
+        try:
+            portal_response = self._session.get(PORTAL_URL)
+        except UFCGError:
+            return False
+        if _is_login_form_render(portal_response.text):
+            return _SESSION_EXPIRED
+        opened = self._open(portal_response.text, str(portal_response.url))
+        if opened is _SESSION_EXPIRED:
+            return _SESSION_EXPIRED
+        if not isinstance(opened, FormAction):
+            return False  # period closed / no search form here: inconclusive, not proof
+        try:
+            response = self._follow(self._session.post(opened))
+        except UFCGError:
+            return False
+        self._capture("verification", response.text)
+        return is_enrolled(response.text)
 
     def _capture(self, label: str, html: str) -> None:
         """Diagnostic-only (SPEC §20): never changes a request or a classification.

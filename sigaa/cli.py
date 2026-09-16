@@ -645,13 +645,16 @@ def _capture_dir_inside_git_worktree(path: Path) -> bool:
 
 
 def _capture_dir_non_empty(path: Path) -> bool:
-    """True when ``path`` already exists and holds at least one entry.
+    """True when ``path`` already exists as a directory and holds an entry.
 
     A reused, populated capture directory restarts the worker's per-process
     numbered-file counter at 1, so a second run's O_EXCL write would crash
     mid-flow (fix: refuse this up front, next to the git-work-tree check).
+    ``is_dir()`` (not ``exists()``) so a regular file short-circuits to False
+    here rather than raising ``NotADirectoryError`` out of ``iterdir()`` --
+    the caller checks "exists but isn't a directory" as its own case.
     """
-    return path.exists() and any(path.iterdir())
+    return path.is_dir() and any(path.iterdir())
 
 
 def _ufcg_result(args, status: str, message: str, exit_code: int) -> int:
@@ -691,6 +694,11 @@ def _cmd_matricula_extraordinaria(args, settings) -> int:
                 return _ufcg_result(
                     args, "error",
                     f"--capture must be outside the git work tree (refused: {capture_path})", 5,
+                )
+            if capture_path.exists() and not capture_path.is_dir():
+                return _ufcg_result(
+                    args, "error",
+                    f"--capture must be a directory, not a file: {capture_path}", 5,
                 )
             if _capture_dir_non_empty(capture_path):
                 return _ufcg_result(

@@ -1,0 +1,49 @@
+<!-- synthetic: sanitized from a real UFCG render, PII and tokens replaced.
+     This is the genuine extraordinária SEARCH page (before any search is
+     submitted): its instructional prose contains "já está matriculado",
+     "choque de horários" and the literal word "MATRICULADO", none of which
+     live inside any SIGAA message panel (#painel-erros, .info, .erros,
+     .aviso, .erro, #mensagens) -- classify_message/is_enrolled must never
+     read this div. Real capture: 0003-search.html, 2026-09-15. -->
+<html>
+<head><title>Matrícula Extraordinária</title></head>
+<body>
+<div class="descricaoOperacao">
+  <ol>
+    <li>
+      Caro(a) Aluno(a), A matrícula extraordinária tem a finalidade de preencher as vagas remanescentes nas turmas ofertadas para o período letivo atual.
+      O período dessa matrícula estende-se de 16/09/2026 a 06/10/2026 . Lembramos que, assim como na matrícula regular, a escolha das turmas está sujeita às
+      regras do Regulamento dos Cursos de Graduação tais como a verificação de pré-requisitos e co-requisitos, as matrículas em componentes equivalentes,
+      bem como o choque de horários com as turmas já matriculadas. Vale ressaltar ainda que essa operação permite somente a matrícula em componentes
+      curriculares que formam turmas, que permitem matrícula on-line pelo próprio aluno e que possuem turmas abertas com vagas remanescentes no ano-semestre
+      de 2026.2 . Atenção para algumas particularidades da matrícula extraordinária: O aluno pode apenas adicionar novas matrículas.
+      Não é possível excluir ou cancelar turmas onde já está matriculado. Só é possível tentar se matricular em 01 (uma) turma de cada vez.
+      Isto exclui a possibilidade de fazer em componentes curriculares que sejam mutuamente correquisitos (um é correquisito do outro, e vice-versa).
+      Salvo quando o aluno realizar matrícula extraordinária em componentes curriculares do tipo BLOCO. O processamento da matrícula ocorrerá imediatamente
+      após sua confirmação da escolha da turma. Caso passe em todas as verificações, você estará automaticamente MATRICULADO** na turma que selecionar.
+      Isso significa que você não poderá desistir de cursar o componente curricular a não ser que efetue um TRANCAMENTO, posteriormente; O critério para a
+      ocupação das vagas é a ordem de chegada, ou seja, quem confirmar a escolha da turma e passar em todas as verificações primeiro, ocupará a vaga.
+      Dessa forma, confirmar a escolha da turma NÃO garante que a matrícula será efetuada, o aluno deve confirmar no histórico se a matrícula foi feita,
+      pois existe a possibilidade pequena que um outro aluno esteja efetuando um procedimento similar ao mesmo tempo, tenha confirmado a escolha na mesma
+      turma instantes antes e ocupe a vaga primeiro. Como o preenchimento das vagas remanescentes é por ordem de chegada, tanto as prioridades quanto as
+      reservas por curso NÃO SÃO LEVADAS EM CONTA na matrícula extraordinária. O aluno RECEBERÁ FALTAS para todos os dias de aula anteriores a matrícula
+      que o professor já lançou frequência. Utilize o formulário abaixo para buscar por turmas que ainda possuem vagas remanescentes. Da lista de
+      resultados da busca, selecione uma turma para tentar se matricular clicando no ícone correspondente.
+    </li>
+  </ol>
+</div>
+<form id="form" name="form" method="post"
+      action="/sigaa/graduacao/matricula/extraordinaria/matricula_extraordinaria.jsf" enctype="application/x-www-form-urlencoded">
+  <input type="hidden" name="form" value="form">
+  <table class="formulario" width="90%">
+    <tr>
+      <td><input type="checkbox" name="form:checkCodigo" value="on"></td>
+      <td><input type="text" name="form:txtCodigo" value=""></td>
+    </tr>
+  </table>
+  <input type="submit" name="form:buscar" value="Buscar">
+  <input type="submit" name="form:cancelar" value="Cancelar">
+  <input type="hidden" name="javax.faces.ViewState" id="javax.faces.ViewState" value="render-fake-0003">
+</form>
+</body>
+</html>

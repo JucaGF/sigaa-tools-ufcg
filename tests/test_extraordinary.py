@@ -69,14 +69,28 @@ def _selection_and_confirmation_handler(
     verification_htmls=None,
 ):
     """login -> menu -> search -> results -> select -> confirmation page,
-    then (optionally) the confirmation POST and portal GET(s) for
-    verification. Every extraordinária POST past the first (search) is
-    counted so callers can tell selection from confirmation.
+    then (optionally) the confirmation POST and verification queries.
+
+    Verification query 1 (`_verify_via_portal`) reads a portal GET directly;
+    every query after that (`_verify_via_search`) re-opens (a plain portal
+    GET feeding `_open`, always a realistic portal.html with a menu, then a
+    menu POST + extraordinária search POST) before its own determination.
+    `verification_htmls[i]` is query i's determination content regardless of
+    which transport it travels over -- callers don't need to know the
+    mechanism. This handler assumes no login-form bounce mid-verification
+    (see the dedicated bespoke handler for that scenario).
     """
     extraordinaria_posts = {"n": 0}
     portal_gets = {"n": 0}
     state = {"confirmation_posts": 0}
-    verification_queue = list(verification_htmls) if verification_htmls is not None else None
+    verify_query = {"i": 0}
+
+    def _next_verification_content() -> str:
+        i = verify_query["i"]
+        verify_query["i"] += 1
+        if verification_htmls is not None and i < len(verification_htmls):
+            return verification_htmls[i]
+        return _fixture("enrolled.html")
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path.split(";")[0]
@@ -88,9 +102,9 @@ def _selection_and_confirmation_handler(
             portal_gets["n"] += 1
             if portal_gets["n"] == 1:
                 return httpx.Response(200, text=_fixture("portal.html"))
-            if verification_queue:
-                return httpx.Response(200, text=verification_queue.pop(0))
-            return httpx.Response(200, text=_fixture("enrolled.html"))
+            if portal_gets["n"] == 2:
+                return httpx.Response(200, text=_next_verification_content())  # verify query 1
+            return httpx.Response(200, text=_fixture("portal.html"))  # feeding _open for query 2+
         if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
             return httpx.Response(200, text=_fixture("search.html"))
         if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
@@ -107,7 +121,7 @@ def _selection_and_confirmation_handler(
                 if confirmation_response is not None:
                     return confirmation_response
                 return httpx.Response(200, text=_fixture("enrolled.html"))
-            raise AssertionError("unexpected extra POST to the extraordinária endpoint")
+            return httpx.Response(200, text=_next_verification_content())  # verify query 2+
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     return handler, state
@@ -905,21 +919,45 @@ def test_redirect_after_confirmation_post_is_not_replayed():
 # --- explicit academic rejection: terminal, exit 3, never retried -----------
 
 
-def test_explicit_academic_rejection_is_terminal_and_skips_verification():
+def test_explicit_academic_rejection_is_confirmed_only_after_verification_finds_no_bond():
+    # Round-2 review fix: verification now ALWAYS runs after a send, before
+    # any rejection is trusted -- a `rejected` result requires both an
+    # explicit refusal message AND verification failing to find the bond.
+    not_enrolled = "<html><body><a href='/sigaa/logar.do?dispatch=logOff'>SAIR</a><p>nada aqui</p></body></html>"
     rejected = httpx.Response(200, text="<html><body><div class='erro'>Choque de horário com outra turma.</div></body></html>")
-    handler, state = _selection_and_confirmation_handler(confirmation_response=rejected)
-    worker, requests = _worker(handler, sleep=_never_sleep)
+    handler, state = _selection_and_confirmation_handler(
+        confirmation_response=rejected,
+        verification_htmls=[not_enrolled, not_enrolled, not_enrolled],
+    )
+    worker, requests = _worker(handler, sleep=lambda delay: None)
     result = worker.run(confirm=True, watch=True, interval=20)
 
     assert result.status == "rejected"
     assert result.exit_code == 3
     assert result.message == "choque de horário"
-    # no verification GET was ever attempted: only the one login-time portal GET
     portal_gets = [
         r for r in requests
         if r.method == "GET" and r.url.path.split(";")[0] == "/sigaa/portais/discente/discente.jsf"
     ]
-    assert len(portal_gets) == 1
+    assert len(portal_gets) > 1  # verification DID run before the rejection was trusted
+
+
+def test_verify_proven_bond_overrides_a_stray_rejection_message():
+    # A post-confirmation render can legitimately contain a real SIGAA
+    # message panel mentioning e.g. "sem vaga" for an unrelated turma while
+    # THIS confirmation actually succeeded. Reporting a false "rejected"
+    # would invite a human to re-run with --confirm -- exactly the double
+    # send this design exists to prevent. A proven bond always wins.
+    stray_rejection = httpx.Response(200, text="<html><body><div class='erro'>Turma 07 sem vaga.</div></body></html>")
+    handler, state = _selection_and_confirmation_handler(
+        confirmation_response=stray_rejection, verification_htmls=[_fixture("enrolled.html")]
+    )
+    worker, _ = _worker(handler)
+    result = worker.run(confirm=True)
+
+    assert result.status == "enrolled"
+    assert result.exit_code == 0
+    assert state["confirmation_posts"] == 1
 
 
 # --- already_enrolled: a message alone is never enough, needs proof ---------
@@ -968,18 +1006,99 @@ def test_verification_inconclusive_after_three_queries_is_unknown_with_backoff()
     assert state["confirmation_posts"] == 1  # unknown never re-sends the confirmation
 
 
+def test_verify_falls_back_to_read_only_search_after_first_inconclusive_portal_query():
+    # Round-2 review fix #6: the SPEC §16 second candidate (re-open + re-
+    # search, read-only) must actually be exercised, not just three identical
+    # portal reads. Query 1 (portal) is inconclusive; query 2 (re-search)
+    # finds an explicit bond in the search-results render itself.
+    search_result_with_bond = (
+        "<html><body><table class='formulario'>"
+        "<tr><th>Componente</th><th>Turma</th><th>Situação</th><th>Período</th></tr>"
+        "<tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td><td>02</td><td>MATRICULADO</td><td>2026.2</td></tr>"
+        "</table></body></html>"
+    )
+    extraordinaria_posts = {"n": 0}
+    portal_gets = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            portal_gets["n"] += 1
+            return httpx.Response(200, text=_fixture("portal.html"))  # never itself shows a bond
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))  # menu postback
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            extraordinaria_posts["n"] += 1
+            n = extraordinaria_posts["n"]
+            if n == 1:
+                return httpx.Response(200, text=_fixture("results.html"))
+            if n == 2:
+                return httpx.Response(200, text=_fixture("confirmation.html"))
+            if n == 3:
+                return httpx.Response(200, text="<html><body>processing</body></html>")
+            if n == 4:
+                return httpx.Response(200, text=search_result_with_bond)  # the re-search verification query
+            raise AssertionError("unexpected extra POST to the extraordinária endpoint")
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    worker, requests = _worker(handler, sleep=lambda delay: None)  # one real backoff wait between the 2 queries
+    result = worker.run(confirm=True)
+
+    assert result.status == "enrolled"
+    assert extraordinaria_posts["n"] == 4  # search + selection + confirmation + the re-search verification query
+    assert portal_gets["n"] == 3  # 1 login-time + 1 verify-via-portal (query 1, inconclusive) + 1 to feed _open
+
+
 # --- a session bounce during verification: relogin, retry the SAME query ---
 
 
 def test_session_bounce_during_verification_relogins_and_retries_only_verification():
-    handler, state = _selection_and_confirmation_handler(
-        verification_htmls=[_fixture("login.html"), _fixture("portal.html")]
-    )
-    worker, requests = _worker(handler)
+    # A dedicated, fully explicit handler (not the shared helper): this
+    # scenario needs precise control over which of the several portal GETs
+    # in play (login's own redirect-follow, verify query 1's own GET, the
+    # relogin's redirect-follow, and verify query 1's retry) returns what.
+    portal_gets = {"n": 0}
+    extraordinaria_posts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            portal_gets["n"] += 1
+            n = portal_gets["n"]
+            if n == 1:
+                return httpx.Response(200, text=_fixture("portal.html"))  # login()'s own redirect-follow
+            if n == 2:
+                return httpx.Response(200, text=_fixture("login.html"))  # verify query 1, attempt 1: bounced
+            if n == 3:
+                return httpx.Response(200, text=_fixture("portal.html"))  # relogin()'s own redirect-follow
+            return httpx.Response(200, text=_fixture("enrolled.html"))  # verify query 1, attempt 2: proven bond
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            extraordinaria_posts["n"] += 1
+            n = extraordinaria_posts["n"]
+            if n == 1:
+                return httpx.Response(200, text=_fixture("results.html"))
+            if n == 2:
+                return httpx.Response(200, text=_fixture("confirmation.html"))
+            if n == 3:
+                return httpx.Response(200, text="<html><body>processing</body></html>")
+            raise AssertionError("unexpected extra POST to the extraordinária endpoint")
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    worker, requests = _worker(handler, sleep=_never_sleep)  # a clean bounce-retry never sleeps
     result = worker.run(confirm=True)
 
-    assert result.status == "enrolled"  # the 4th portal GET (after relogin) falls through to the default enrolled.html
-    assert state["confirmation_posts"] == 1  # the session bounce never triggers a second confirmation
+    assert result.status == "enrolled"
+    assert extraordinaria_posts["n"] == 3  # search + selection + confirmation -- the bounce never re-sends confirmation
     login_gets = [r for r in requests if r.url.path.split(";")[0] == "/sigaa/verTelaLogin.do"]
     assert len(login_gets) == 2  # the initial login + exactly one relogin during verification
 

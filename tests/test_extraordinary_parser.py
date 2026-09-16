@@ -478,6 +478,9 @@ def test_selection_action_rebuilds_current_hidden_fields_plus_row_postback():
 # --- confirmation_action / confirmation_identity_fields ---------------------
 
 
+_CONFIRMATION_ACTION = "/sigaa/graduacao/matricula/extraordinaria/confirmacao.jsf"
+
+
 def test_confirmation_identity_fields_are_located_dynamically_with_empty_values():
     html = _fixture("confirmation_real.html")
     names = confirmation_identity_fields(html)
@@ -502,16 +505,31 @@ def test_confirmation_identity_fields_are_located_dynamically_with_empty_values(
     assert "S3ntinelSecretValue" not in repr(filled)
 
 
-def test_confirmation_action_without_password_field_fails_closed():
+def test_confirmation_action_form_not_found_fails_closed():
+    # No form carries the confirmacao.jsf action at all (e.g. a bare portal
+    # render): `_find_confirmation_form` returns None and this must be
+    # reported as "form not found", never mistaken for a form that WAS
+    # located but happens to lack a password field (see the next test).
     html = "<html><body><form name='form'><input type='hidden' name='javax.faces.ViewState' value='x'></form></body></html>"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="extraordinária confirmation form not found"):
+        confirmation_action(html, SEARCH_URL)
+
+
+def test_confirmation_action_without_password_field_fails_closed():
+    # The form IS located (real confirmacao.jsf action, ViewState present)
+    # but carries no password input -- this must reach and trip
+    # `_identity_fields`'s own "no password field" assertion, not the
+    # "form not found" branch a missing `action` would hit instead.
+    html = (
+        f"<html><body><form name='form' action='{_CONFIRMATION_ACTION}'>"
+        "<input type='hidden' name='javax.faces.ViewState' value='x'>"
+        "</form></body></html>"
+    )
+    with pytest.raises(ValueError, match="extraordinária confirmation form has no password field"):
         confirmation_action(html, SEARCH_URL)
 
 
 # --- confirmation_identity_fields: birth-date field must fail closed on ambiguity
-
-
-_CONFIRMATION_ACTION = "/sigaa/graduacao/matricula/extraordinaria/confirmacao.jsf"
 
 
 def test_confirmation_identity_fields_single_birthdate_candidate_is_used():

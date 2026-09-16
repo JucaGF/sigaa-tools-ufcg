@@ -112,12 +112,105 @@ def test_global_user_override_returns_five(monkeypatch):
     assert not flag["called"]
 
 
-def test_confirm_returns_five_before_any_session(monkeypatch):
-    _never_open_session(monkeypatch)
-    flag = _never_touch_keyring(monkeypatch)
+def test_confirm_reaches_the_worker_with_confirm_true(monkeypatch):
+    # --confirm is now live (repo owner authorized the confirmation POST for
+    # 1109103/02, SPEC §25 phase 3/§27.8/§28): it must reach
+    # ExtraordinaryWorker.run as confirm=True instead of being blocked here.
+    monkeypatch.setitem(
+        sys.modules,
+        "keyring",
+        SimpleNamespace(get_password=lambda s, k: "jucag" if k == "__active_username__" else "s3cr3t"),
+    )
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    class FakeWorker:
+        def __init__(self, session, confirmation_secret, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            assert kwargs == {"confirm": True, "watch": False, "interval": 20.0}
+            return RunResult("enrolled", "matrícula confirmada", 0)
+
+    monkeypatch.setattr(cli_module, "UFCGSession", FakeSession)
+    monkeypatch.setattr(cli_module, "ExtraordinaryWorker", FakeWorker)
+    args = _parse("--codigo", "1109103", "--turma", "02", "--confirm")
+    assert cli_module._cmd_matricula_extraordinaria(args, None) == 0
+
+
+def test_default_run_still_passes_confirm_false_to_the_worker(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "keyring",
+        SimpleNamespace(get_password=lambda s, k: "jucag" if k == "__active_username__" else "s3cr3t"),
+    )
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    class FakeWorker:
+        def __init__(self, session, confirmation_secret, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            assert kwargs == {"confirm": False, "watch": False, "interval": 20.0}
+            return RunResult("prepared", "matrícula preparada (dry-run)", 0)
+
+    monkeypatch.setattr(cli_module, "UFCGSession", FakeSession)
+    monkeypatch.setattr(cli_module, "ExtraordinaryWorker", FakeWorker)
+    args = _parse("--codigo", "1109103", "--turma", "02")
+    assert cli_module._cmd_matricula_extraordinaria(args, None) == 0
+
+
+def test_confirm_with_unresolvable_secret_returns_five_without_sending(monkeypatch):
+    # Mirrors the worker-level guarantee (tests/test_extraordinary.py::
+    # test_confirm_fails_with_exit_five_before_sending_when_secret_unresolvable)
+    # at the CLI boundary: the worker fails closed with exit 5 before any
+    # POST when a required confirmation secret (e.g. birth date) can't be
+    # resolved, and the CLI must relay that exit code unchanged.
+    monkeypatch.setitem(
+        sys.modules,
+        "keyring",
+        SimpleNamespace(get_password=lambda s, k: "jucag" if k == "__active_username__" else "s3cr3t"),
+    )
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    class FakeWorker:
+        def __init__(self, session, confirmation_secret, **kwargs):
+            pass
+
+        def run(self, **kwargs):
+            assert kwargs["confirm"] is True
+            return RunResult("error", "UFCG birth_date not configured", 5)
+
+    monkeypatch.setattr(cli_module, "UFCGSession", FakeSession)
+    monkeypatch.setattr(cli_module, "ExtraordinaryWorker", FakeWorker)
     args = _parse("--codigo", "1109103", "--turma", "02", "--confirm")
     assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
-    assert not flag["called"]
 
 
 def test_watch_alone_is_no_longer_rejected_and_reaches_the_worker(monkeypatch):
@@ -378,7 +471,8 @@ def test_json_output_has_exactly_the_documented_keys(monkeypatch, capsys):
 def test_config_error_json_also_uses_the_documented_keys(monkeypatch, capsys):
     _never_open_session(monkeypatch)
     _never_touch_keyring(monkeypatch)
-    args = _parse("--codigo", "1109103", "--turma", "02", "--confirm", "--json")
+    args = _parse("--codigo", "1109103", "--turma", "02", "--json")
+    args.codigo = "9999999"  # wrong component: config error, before any session
     exit_code = cli_module._cmd_matricula_extraordinaria(args, None)
 
     assert exit_code == 5
@@ -416,6 +510,51 @@ def test_secrets_never_appear_in_stdout_or_stderr(monkeypatch, capsys):
     monkeypatch.setattr(cli_module, "UFCGSession", FakeSession)
     monkeypatch.setattr(cli_module, "ExtraordinaryWorker", FakeWorker)
     args = _parse("--codigo", "1109103", "--turma", "02", "--json")
+    cli_module._cmd_matricula_extraordinaria(args, None)
+
+    captured = capsys.readouterr()
+    assert "S3ntinelPW" not in captured.out
+    assert "S3ntinelPW" not in captured.err
+    assert "S3ntinelBD" not in captured.out
+    assert "S3ntinelBD" not in captured.err
+    assert "jucag" not in captured.out
+    assert "jucag" not in captured.err
+
+
+def test_secrets_never_appear_in_stdout_or_stderr_on_the_confirm_path(monkeypatch, capsys):
+    # Same guarantee as above, but with --confirm actually passed (the
+    # previous test never did) and simulating a real enrolled/rejected
+    # outcome, so the confirm=True path is the one under test here.
+    store = {
+        ("sigaa-ufcg", "__active_username__"): "jucag",
+        ("sigaa-ufcg", "jucag"): "S3ntinelPW",
+        ("sigaa-ufcg", "jucag:birth_date"): "S3ntinelBD",
+    }
+    monkeypatch.setitem(
+        sys.modules, "keyring", SimpleNamespace(get_password=lambda s, k: store.get((s, k)))
+    )
+
+    class FakeSession:
+        def __init__(self, username, password):
+            assert password() == "S3ntinelPW"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    class FakeWorker:
+        def __init__(self, session, confirmation_secret, capture_dir=None):
+            assert confirmation_secret("birth_date") == "S3ntinelBD"
+
+        def run(self, **kwargs):
+            assert kwargs["confirm"] is True
+            return RunResult("enrolled", "matrícula confirmada", 0)
+
+    monkeypatch.setattr(cli_module, "UFCGSession", FakeSession)
+    monkeypatch.setattr(cli_module, "ExtraordinaryWorker", FakeWorker)
+    args = _parse("--codigo", "1109103", "--turma", "02", "--confirm", "--json")
     cli_module._cmd_matricula_extraordinaria(args, None)
 
     captured = capsys.readouterr()

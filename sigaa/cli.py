@@ -198,7 +198,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_extra.add_argument(
         "--confirm", action="store_true",
-        help="not enabled yet (returns exit 5): mutation is gated on a real results/confirmation capture",
+        help="submit the confirmation POST for 1109103/02 after a successful search (live mutation; default is dry-run)",
     )
     p_extra.add_argument(
         "--interval", type=float, default=20.0, help="seconds between polls (default 20, min 10)"
@@ -684,9 +684,6 @@ def _cmd_matricula_extraordinaria(args, settings) -> int:
             return _ufcg_result(
                 args, "error", "the global --user override is not supported for matricula-extraordinaria", 5
             )
-        if args.confirm:
-            return _ufcg_result(args, "error", "--confirm is not enabled yet in this version", 5)
-
         capture_dir = None
         if getattr(args, "capture", None):
             capture_path = Path(args.capture)

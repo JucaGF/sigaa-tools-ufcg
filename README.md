@@ -78,7 +78,7 @@ Agents can call `sipac_get_public_process` with `{"number": "23074.056437/2026-2
 Headless fallback: `export SIGAA_USER=... SIGAA_PASS=...`.
 Optional `SIGAA_DB=/path/to/sigaa.db` to override the store location.
 
-## UFCG matrícula extraordinária (experimental, dry-run only)
+## UFCG matrícula extraordinária (experimental; dry-run by default, `--confirm` is live)
 
 A separate, local, deterministic worker for the UFCG SIGAA (not UFPB): it
 logs in, opens matrícula extraordinária, and searches component `1109103`
@@ -90,16 +90,15 @@ server.
 sigaa matricula-extraordinaria --codigo 1109103 --turma 02 --json
 ```
 
-This is currently a **dry-run search only**: it authenticates, opens the
-extraordinária (menu postback, falling back to the direct endpoint), submits
-the search, and reports one of `period_closed`, `session_expired`, or
-`error` (SIGAA's real results page still isn't captured/modeled, so a
-successful search reports `error` with the message `captura de resultados
-necessária`). `--confirm` and `--watch` are accepted by the parser but both
-currently return exit code 5 ("not enabled yet") — `--watch` is not enabled
-until a later polling/backoff task, and `--confirm` stays disabled until a
-real capture of the confirmation form exists and is tested. No mutation is
-possible from this command yet.
+By default this is a **dry-run**: it authenticates, opens the extraordinária,
+selects turma 02 of component 1109103, and stops at `prepared` (exit 0)
+without sending anything. Pass **`--confirm`** to actually submit: it sends
+the SIGAA confirmation POST exactly once for the prepared attempt, then
+re-checks the resulting enrollment bond before reporting `enrolled`,
+`rejected`, or `unknown` — this is a real, live mutation of your SIGAA
+enrollment, authorized only for component `1109103` turma `02`. `--watch`
+polls with backoff (SPEC §18) while the period is closed or a transient
+error occurs.
 
 Credentials use their own keyring service, **`sigaa-ufcg`** (separate from
 UFPB's `sigaa-ufpb`):
@@ -108,7 +107,7 @@ UFPB's `sigaa-ufpb`):
 | --- | --- | --- |
 | Username | `__active_username__` | `SIGAA_USER` |
 | Password | `<username>` | `SIGAA_PASS` |
-| Birth date (confirmation only, unused so far) | `<username>:birth_date` | `SIGAA_BIRTH_DATE` |
+| Birth date (only if the confirmation form asks for it) | `<username>:birth_date` | `SIGAA_BIRTH_DATE` |
 
 A missing or erroring keyring backend falls back to the environment
 variables. The global `--user` override is not supported for this command

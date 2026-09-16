@@ -10,10 +10,11 @@ dry-run preparation (SPEC §14, terminal `prepared`/0, never serialized); and
 confirmation + post-condition verification at the worker level (SPEC §15-16),
 gated entirely behind `confirm=True` passed directly to `ExtraordinaryWorker`.
 
-`--confirm` on the CLI is a SEPARATE decision from this module's own confirm
-support: the CLI refuses `--confirm` unconditionally (exit 5, SPEC §25 phase 1
-gate) regardless of what this module can do -- enabling it is a decision the
-repo owner makes at the permission layer, not something this module lifts.
+`--confirm` on the CLI now reaches this module's own confirm support
+directly (SPEC §25 phase 3, §27.8, §28): the repo owner authorized the live
+confirmation POST for component 1109103, turma 02, and the CLI's per-run
+gate was removed accordingly. `--confirm` stays required for any
+confirmation -- the default run is still a dry-run that stops at `prepared`.
 
 `--capture DIR` is a diagnostic-only side channel (SPEC §20): every HTML
 render the flow receives is also written to numbered files under `DIR`. It

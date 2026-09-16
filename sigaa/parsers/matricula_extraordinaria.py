@@ -476,18 +476,52 @@ def confirmation_identity_fields(html: str) -> dict[str, str]:
     return names
 
 
+_CANCEL_HINT_RE = re.compile(r"cancel|volt")
+_CONFIRM_HINT_RE = re.compile(r"confirm")
+
+
+def _fold(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
+
+
+def _find_confirmation_button(form: Tag) -> Tag:
+    """Review fix: the real confirmation button's name/value has never been
+    captured from a live render, so unlike `search_action`'s exact match on
+    the known `form:buscar`, this can only guess -- and the earlier guess
+    ("first submit/image control in document order") posts Cancelar instead
+    of Confirmar whenever a real render puts Cancelar first, with
+    `prepared.sent` already True by the time that mistake is discovered.
+
+    Picks the control whose name/value reads as "confirm" (casefolded,
+    accent-insensitive); excludes any reading as "cancel"/"voltar" outright;
+    and fails closed (`ValueError`) when that leaves anything other than
+    exactly one candidate, rather than guessing among several.
+    """
+    controls = form.find_all(attrs={"type": re.compile("^(submit|image)$", re.IGNORECASE), "name": True})
+    if not controls:
+        raise ValueError("extraordinária confirmation form has no submit/image command button")
+    candidates = [c for c in controls if not _CANCEL_HINT_RE.search(_fold(f"{c['name']} {c.get('value', '')}"))]
+    if len(candidates) == 1:
+        return candidates[0]
+    confirm_candidates = [c for c in candidates if _CONFIRM_HINT_RE.search(_fold(f"{c['name']} {c.get('value', '')}"))]
+    if len(confirm_candidates) == 1:
+        return confirm_candidates[0]
+    raise ValueError("extraordinária confirmation form has no unambiguous confirm command button")
+
+
 def confirmation_action(html: str, url: str) -> FormAction:
     """Round-2 review fix: a JSF form posted without its command-button
     parameter never invokes the action (it just re-renders) -- the button
-    is located and added exactly as `search_action` does for `form:buscar`.
-    Fails closed (`ValueError`) when no submit/image control is found, same
-    as a missing password field.
+    is located and added, via `_find_confirmation_button` (see its
+    docstring: this cannot match the real button by name the way
+    `search_action` matches `form:buscar`, so it is heuristic and fails
+    closed on ambiguity). Also fails closed when no submit/image control is
+    found at all, same as a missing password field.
     """
     form, names = _identity_fields(html)
     _require_viewstate(form.select('input[type="hidden"][name]'), "extraordinária confirmation form")
-    button = form.find(attrs={"type": re.compile("^(submit|image)$", re.IGNORECASE), "name": True})
-    if button is None:
-        raise ValueError("extraordinária confirmation form has no submit/image command button")
+    button = _find_confirmation_button(form)
     overrides = [(name, "") for name in names.values()]
     overrides.append((button["name"], button.get("value", "")))
     fields = build_form_payload(form, overrides)

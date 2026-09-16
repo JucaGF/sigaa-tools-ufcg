@@ -468,6 +468,39 @@ def test_confirmation_action_without_a_command_button_fails_closed():
         confirmation_action(html, SEARCH_URL)
 
 
+def test_confirmation_action_skips_a_cancel_button_rendered_before_confirm():
+    # Review fix: the old lookup took the FIRST submit/image control in
+    # document order, which posts Cancelar (with `prepared.sent` already
+    # True) if the real form ever renders it before Confirmar.
+    html = (
+        "<html><body><form name='form' action='/x'>"
+        "<input type='hidden' name='javax.faces.ViewState' value='x'>"
+        "<input type='password' name='form:senha' value=''>"
+        "<input type='submit' name='form:cancelar' value='Cancelar'>"
+        "<input type='submit' name='form:confirmar' value='Confirmar Matrícula'>"
+        "</form></body></html>"
+    )
+    action = confirmation_action(html, SEARCH_URL)
+    fields = dict(action.fields)
+    assert fields["form:confirmar"] == "Confirmar Matrícula"
+    assert "form:cancelar" not in fields
+
+
+def test_confirmation_action_ambiguous_buttons_fail_closed():
+    # Two submit controls, neither reading as "confirm" nor "cancel"/"voltar":
+    # no rule picks a winner, so this must fail closed rather than guess.
+    html = (
+        "<html><body><form name='form' action='/x'>"
+        "<input type='hidden' name='javax.faces.ViewState' value='x'>"
+        "<input type='password' name='form:senha' value=''>"
+        "<input type='submit' name='form:btn1' value='OK'>"
+        "<input type='submit' name='form:btn2' value='Enviar'>"
+        "</form></body></html>"
+    )
+    with pytest.raises(ValueError):
+        confirmation_action(html, SEARCH_URL)
+
+
 # --- is_enrolled: same row, same semester -----------------------------------
 
 

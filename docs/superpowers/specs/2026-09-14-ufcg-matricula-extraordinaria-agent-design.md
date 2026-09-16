@@ -353,15 +353,37 @@ form:cancelar
 javax.faces.ViewState
 ```
 
-Para esta versão, a busca preenche apenas:
+Para esta versão, a busca preenche:
 
 ```text
-form:checkCodigo=checked
+form:checkCodigo=on
 form:txtCodigo=1109103
 form:buscar=<valor atual do botão>
+form:comboDepartamento=<opção atualmente selecionada do render>
 ```
 
 Todos os hidden inputs são copiados do render atual.
+
+**Correção pós-abertura (captura real, 2026-09-16 ~05:00-05:06):** o payload
+documentado acima nesta seção original (`form:checkCodigo=checked`, sem
+`form:comboDepartamento`) foi testado ao vivo contra o endpoint real e
+REJEITADO duas vezes antes de funcionar:
+
+1. Omitir `form:comboDepartamento` -- um `<select>` não é um hidden input, e o
+   payload original nunca o enviava -- produziu
+   `form:comboDepartamento: Campo obrigatório não informado ou valor
+   informado para o campo é inválido.` Correção: enviar cada `<select>` do
+   formulário com o valor de sua opção atualmente selecionada (a primeira
+   opção quando nenhuma tem `selected`).
+2. Enviar `form:checkCodigo=checked` -- um navegador real envia `on` para uma
+   checkbox marcada sem atributo `value`, nunca a string `checked` -- produziu
+   `Por favor, escolha algum critério de busca` (SIGAA leu a checkbox como
+   desmarcada). Correção: `form:checkCodigo=on`.
+
+Com as duas correções, a busca funcionou. A resposta real para o alvo (1109103)
+foi a mensagem de painel `Não foram encontradas turmas abertas com vagas
+remanescentes para os parâmetros de busca especificados.` -- i.e. sem vaga
+remanescente no momento, não um erro do agente.
 
 Antes da abertura, o POST de busca retornou silenciosamente ao Portal do Discente.
 A detecção de período fechado deve aceitar qualquer um destes sinais:

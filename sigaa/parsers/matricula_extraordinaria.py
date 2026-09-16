@@ -73,7 +73,22 @@ _ENROLLED_STATUS_RE = re.compile(r"\bmatriculado\b", re.IGNORECASE)
 _UNKNOWN_RESPONSE = "resposta desconhecida"
 _MESSAGE_SELECTOR = "#painel-erros li, .info, .erros li, .aviso, .erro, #mensagens li"
 _MESSAGE_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("sem vaga", ("sem vaga", "não há vaga", "vaga indisponível", "não possui vaga")),
+    (
+        "sem vaga",
+        (
+            "sem vaga", "não há vaga", "vaga indisponível", "não possui vaga",
+            # Live capture 2026-09-16: the real search-result phrase when the
+            # target component currently has no remaining vacancies.
+            "não foram encontradas turmas abertas com vagas remanescentes",
+        ),
+    ),
+    (
+        # Live capture 2026-09-16: our own search payload was malformed (a
+        # missing <select>, then a checkbox value SIGAA didn't recognize) --
+        # a protocol bug, never a legitimate academic outcome, never pollable.
+        "parâmetros de busca inválidos",
+        ("campo obrigatório não informado", "por favor, escolha algum critério de busca"),
+    ),
     ("já matriculado", ("já matriculado", "já está matriculado", "já possui matrícula")),
     ("choque de horário", ("choque de horário", "conflito de horário", "coincidência de horário")),
     ("pré-requisito ou correquisito", ("pré-requisito", "pre-requisito", "correquisito", "co-requisito")),
@@ -205,6 +220,15 @@ def menu_action(html: str, url: str) -> FormAction | None:
     return FormAction(action_url, tuple(fields))
 
 
+def _selected_option_value(select: Tag) -> str:
+    """The value a browser would submit for ``select``: the selected option, else the first."""
+    options = select.select("option")
+    chosen = next((o for o in options if o.has_attr("selected")), options[0] if options else None)
+    if chosen is None:
+        return ""
+    return chosen.get("value", chosen.get_text(strip=True))
+
+
 def search_action(html: str, url: str, code: str) -> FormAction:
     """Build the search postback: only the three documented fields are filled.
 
@@ -218,10 +242,19 @@ def search_action(html: str, url: str, code: str) -> FormAction:
         raise ValueError("extraordinária search form not found")
     button = form.find(attrs={"name": "form:buscar"})
     buscar_value = button.get("value", "") if button is not None else ""
+    # The real render (captured 2026-09-16) rejects a payload that omits the
+    # department <select>: "form:comboDepartamento: Campo obrigatório não
+    # informado". Selects are not hidden inputs, so send each one's currently
+    # selected option, which on the search form is "-- SELECIONE --" (value 0).
+    selects = [(node["name"], _selected_option_value(node)) for node in form.select("select[name]")]
     fields = build_form_payload(
         form,
         [
-            ("form:checkCodigo", "checked"),
+            *selects,
+            # A browser submits "on" for a checked checkbox with no value
+            # attribute; the real render rejected "checked" with "Por favor,
+            # escolha algum critério de busca" (captured 2026-09-16).
+            ("form:checkCodigo", "on"),
             ("form:txtCodigo", code),
             ("form:buscar", buscar_value),
         ],

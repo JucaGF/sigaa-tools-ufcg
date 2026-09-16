@@ -158,19 +158,42 @@ def test_menu_action_finds_the_postback_inside_a_script_menu_array():
 # --- search_action -----------------------------------------------------------
 
 
-def test_search_action_fills_only_the_three_documented_overrides():
+def test_search_action_fills_the_live_verified_overrides():
+    # Live capture 2026-09-16: a real render rejected "form:checkCodigo=checked"
+    # ("Por favor, escolha algum critério de busca" -- a browser submits "on"
+    # for a checked checkbox with no value attribute) and rejected a payload
+    # missing "form:comboDepartamento" ("Campo obrigatório não informado").
     html = _fixture("search.html")
     action = search_action(html, SEARCH_URL, "1109103")
     assert action.action == SEARCH_URL
     fields = dict(action.fields)
-    assert fields["form:checkCodigo"] == "checked"
+    assert fields["form:checkCodigo"] == "on"
     assert fields["form:txtCodigo"] == "1109103"
     assert fields["form:buscar"] == "Buscar"
+    assert fields["form:comboDepartamento"] == "0"
     # hidden fields from the current render are preserved
     assert fields["form"] == "form"
     assert fields["javax.faces.ViewState"] == "render-fake-0002"
     # fields not part of the documented overrides are not touched/added
     assert "form:txtNome" not in fields
+
+
+def test_search_action_sends_the_selects_explicitly_selected_option():
+    # Regression for the live-verified contract: a <select> is not a hidden
+    # input, so its currently *selected* option (not just the first one) must
+    # be sent, exactly as a browser would submit it.
+    html = """<html><body><form name="form" method="post" action="x.jsf">
+      <select name="form:comboDepartamento">
+        <option value="0">-- SELECIONE --</option>
+        <option value="588" selected="selected">ASSESSORIA</option>
+      </select>
+      <input type="submit" name="form:buscar" value="Buscar">
+      <input type="hidden" name="javax.faces.ViewState" value="render-fake-0002">
+    </form></body></html>"""
+    action = search_action(html, SEARCH_URL, "1109103")
+    fields = dict(action.fields)
+    assert fields["form:comboDepartamento"] == "588"
+    assert fields["form:checkCodigo"] == "on"
 
 
 def test_search_action_uses_the_buscar_button_label_of_the_current_render():
@@ -626,6 +649,21 @@ def test_selection_action_raises_when_row_has_no_recognized_control():
         ("Senha incorreta, tente novamente.", "dados de confirmação incorretos"),
         ("Sua sessão expirou, faça login novamente.", "sessão expirada"),
         ("Sistema indisponível, tente novamente mais tarde.", "indisponibilidade do sistema"),
+        # Live capture 2026-09-16: the real "no remaining vacancies" search
+        # response, verbatim.
+        (
+            "Não foram encontradas turmas abertas com vagas remanescentes "
+            "para os parâmetros de busca especificados.",
+            "sem vaga",
+        ),
+        # Live capture 2026-09-16: the two real validation errors caused by a
+        # malformed search payload -- protocol failures, never pollable.
+        (
+            "form:comboDepartamento: Campo obrigatório não informado ou "
+            "valor informado para o campo é inválido.",
+            "parâmetros de busca inválidos",
+        ),
+        ("Por favor, escolha algum critério de busca", "parâmetros de busca inválidos"),
     ],
 )
 def test_classify_message_categories(text, expected):

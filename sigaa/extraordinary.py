@@ -67,6 +67,7 @@ _PERIOD_CLOSED_MESSAGE = "matrícula extraordinária period is not open"
 _SESSION_EXPIRED_MESSAGE = "SIGAA session expired; the retry also expired"
 _TARGET_NOT_FOUND_MESSAGE = "componente 1109103 turma 02 não encontrado nos resultados da busca"
 _NO_VACANCY_MESSAGE = "turma 02 sem vaga disponível no momento"
+_SEARCH_PAYLOAD_INVALID_MESSAGE = "extraordinária search payload rejected by SIGAA (invalid parameters)"
 _AMBIGUOUS_TARGET_MESSAGE = "resultados da extraordinária ambíguos para o alvo (duas linhas equivalentes)"
 _SELECTION_UNRECOGNIZED_MESSAGE = "SIGAA did not present a recognizable selection control for turma 02"
 _CONFIRMATION_MISMATCH_MESSAGE = "confirmation page does not confirm the same component/turma"
@@ -284,6 +285,21 @@ class ExtraordinaryWorker:
         try:
             rows = parse_classes(html)
         except ValueError:
+            # Live capture 2026-09-16: a well-formed search with no results
+            # table is a *recognized* SIGAA answer, not an unmodeled render --
+            # `classify_message` (panel-scoped, per its own docstring) tells
+            # the two apart before falling back to the generic "unrecognized
+            # DOM" diagnostic. "sem vaga" (no remaining vacancies) is a real
+            # academic state, watchable; the two payload-validation messages
+            # mean OUR request was malformed, a protocol bug that a --watch
+            # retry can never fix, so it fails fast instead.
+            category = classify_message(html)
+            if category == "sem vaga":
+                _log("TARGET_UNAVAILABLE", reason="no_vacancy")
+                return RunResult("no_vacancy", _NO_VACANCY_MESSAGE, 2)
+            if category == "parâmetros de busca inválidos":
+                _log("FATAL_ERROR", reason="search_payload_invalid")
+                return RunResult("error", _SEARCH_PAYLOAD_INVALID_MESSAGE, 6)
             _log("FATAL_ERROR", reason="results_capture_needed")
             return RunResult("error", _RESULTS_CAPTURE_MESSAGE, 6)
         try:

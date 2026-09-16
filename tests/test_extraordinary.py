@@ -147,7 +147,9 @@ def test_run_reaches_search_via_the_menu_postback_and_reports_capture_needed():
             return httpx.Response(200, text=_fixture("search.html"))
         if path == "/sigaa/graduacao/matricula/extraordinaria/matricula_extraordinaria.jsf" and request.method == "POST":
             body = _body(request)
-            assert body["form:checkCodigo"] == "checked"
+            # Live capture 2026-09-16: a checked checkbox with no value
+            # attribute submits "on", not "checked".
+            assert body["form:checkCodigo"] == "on"
             assert body["form:txtCodigo"] == COMPONENT_CODE
             assert body["javax.faces.ViewState"] == "render-fake-0002"
             return httpx.Response(
@@ -1410,6 +1412,104 @@ def test_watch_polls_on_no_vacancy():
         worker.run(watch=True, interval=20)
 
     assert delays == [20, 20]
+
+
+# --- no_vacancy from the real SIGAA "no remaining vacancies" search message,
+# not a results table with a zero-vacancy row (live capture 2026-09-16: the
+# real response has no results table at all -- `Não foram encontradas turmas
+# abertas com vagas remanescentes...` inside #painel-erros). Falling through
+# to "captura de resultados necessária" (terminal, exit 6) on this exact
+# response is the bug that stopped the --watch worker during the live window.
+
+
+def test_run_classifies_the_real_no_vacancy_search_message_as_no_vacancy():
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            return httpx.Response(200, text=_fixture("portal.html"))
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search_result_no_vacancy.html"))
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    worker, _ = _worker(handler)
+    result = worker.run()
+
+    assert result == RunResult("no_vacancy", "turma 02 sem vaga disponível no momento", 2)
+
+
+def test_watch_keeps_polling_after_the_real_no_vacancy_search_message():
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            return httpx.Response(200, text=_fixture("portal.html"))
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search_result_no_vacancy.html"))
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    delays: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 3:
+            raise KeyboardInterrupt
+
+    worker, _ = _worker(handler, sleep=fake_sleep, now=lambda: 0.0)
+    with pytest.raises(KeyboardInterrupt):
+        worker.run(watch=True, interval=20)
+
+    # the worker cycles indefinitely (fake clock, cut off after 3 cycles here)
+    # instead of stopping dead the way "captura de resultados necessária" did.
+    assert delays == [20, 20, 20]
+
+
+# --- the two real payload-validation errors (live capture 2026-09-16): our
+# own search POST was malformed -- these are protocol failures, never a
+# legitimate academic outcome, and must fail fast even under --watch.
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["search_result_missing_department.html", "search_result_missing_criteria.html"],
+)
+def test_run_treats_a_search_payload_validation_error_as_terminal(fixture_name):
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            return httpx.Response(200, text=_fixture("portal.html"))
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            return httpx.Response(200, text=_fixture(fixture_name))
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    worker, _ = _worker(handler, sleep=_never_sleep)
+    result = worker.run(watch=True, interval=20)  # terminal even with --watch: never polls
+
+    # A distinct diagnostic from the generic "captura de resultados
+    # necessária": this DOM *was* recognized -- as our own payload being
+    # rejected, not as an unmodeled render.
+    assert result == RunResult(
+        "error", "extraordinária search payload rejected by SIGAA (invalid parameters)", 6
+    )
+    # SIGAA's own validation-error body text is never echoed back.
+    assert "comboDepartamento" not in result.message
+    assert "critério de busca" not in result.message
 
 
 def test_watch_polls_on_target_not_found():

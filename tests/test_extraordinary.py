@@ -4,6 +4,7 @@ MockTransport sequences with explicit response queues, per fixture render.
 POST bodies are compared with parse_qsl so field order never matters.
 """
 
+import os
 import stat
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -13,7 +14,15 @@ from urllib.parse import parse_qsl
 import httpx
 import pytest
 
-from sigaa.extraordinary import CLASS_LABEL, COMPONENT_CODE, ExtraordinaryWorker, RunResult, retry_delay
+from sigaa.extraordinary import (
+    CLASS_LABEL,
+    COMPONENT_CODE,
+    ExtraordinaryWorker,
+    RunResult,
+    _is_available,
+    retry_delay,
+)
+from sigaa.parsers.matricula_extraordinaria import ExtraordinaryClass
 from sigaa.ufcg import UFCGSession
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ufcg"
@@ -49,6 +58,59 @@ def _never_sleep(delay: float) -> None:
 
 def _body(request: httpx.Request) -> dict:
     return dict(parse_qsl(request.content.decode(), keep_blank_values=True))
+
+
+def _selection_and_confirmation_handler(
+    *,
+    results_html=None,
+    confirmation_html=None,
+    confirmation_response=None,
+    confirmation_raises=False,
+    verification_htmls=None,
+):
+    """login -> menu -> search -> results -> select -> confirmation page,
+    then (optionally) the confirmation POST and portal GET(s) for
+    verification. Every extraordinária POST past the first (search) is
+    counted so callers can tell selection from confirmation.
+    """
+    extraordinaria_posts = {"n": 0}
+    portal_gets = {"n": 0}
+    state = {"confirmation_posts": 0}
+    verification_queue = list(verification_htmls) if verification_htmls is not None else None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            portal_gets["n"] += 1
+            if portal_gets["n"] == 1:
+                return httpx.Response(200, text=_fixture("portal.html"))
+            if verification_queue:
+                return httpx.Response(200, text=verification_queue.pop(0))
+            return httpx.Response(200, text=_fixture("enrolled.html"))
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            extraordinaria_posts["n"] += 1
+            n = extraordinaria_posts["n"]
+            if n == 1:
+                return httpx.Response(200, text=results_html or _fixture("results.html"))
+            if n == 2:
+                return httpx.Response(200, text=confirmation_html or _fixture("confirmation.html"))
+            if n == 3:
+                state["confirmation_posts"] += 1
+                if confirmation_raises:
+                    raise httpx.ReadTimeout("synthetic timeout", request=request)
+                if confirmation_response is not None:
+                    return confirmation_response
+                return httpx.Response(200, text=_fixture("enrolled.html"))
+            raise AssertionError("unexpected extra POST to the extraordinária endpoint")
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    return handler, state
 
 
 # --- happy-path plumbing: login -> menu -> search, unknown results DOM -------
@@ -318,7 +380,7 @@ def test_run_returns_session_expired_after_two_login_form_bounces():
     result = worker.run()
 
     assert result == RunResult(
-        "session_expired", "SIGAA session expired during search; the retry also expired", 7
+        "session_expired", "SIGAA session expired; the retry also expired", 7
     )
     login_gets = [r for r in requests if r.url.path.split(";")[0] == "/sigaa/verTelaLogin.do"]
     assert len(login_gets) == 2  # exactly one reconstruction, no unbounded retry
@@ -354,6 +416,7 @@ def test_open_phase_login_form_bounce_is_session_expired_not_a_misclassified_per
 
     assert result.status == "session_expired"
     assert result.exit_code == 7
+    assert result.message == "SIGAA session expired; the retry also expired"  # generalized wording, not "during search"
     login_gets = [r for r in requests if r.url.path.split(";")[0] == "/sigaa/verTelaLogin.do"]
     assert len(login_gets) == 2  # exactly one reconstruction, no unbounded retry
 
@@ -632,6 +695,63 @@ def test_watch_recovers_from_an_open_phase_session_bounce_with_backoff_then_stop
 # --- --capture: numbered HTML renders, private permissions -------------------
 
 
+def test_capture_dir_is_private_even_when_its_parent_did_not_exist_yet(tmp_path):
+    # Fix (review): mkdir(parents=True, exist_ok=True) + a later chmod left a
+    # window where the directory was created at the (umask-clipped) default
+    # mode before being tightened. mode=0o700 at creation time closes that
+    # window for the leaf directory itself. Directory setup happens in
+    # __init__, so no run() is needed to observe it.
+    capture_dir = tmp_path / "nested" / "capture"
+    assert not capture_dir.parent.exists()
+
+    _worker(lambda request: httpx.Response(200), capture_dir=capture_dir)
+
+    assert stat.S_IMODE(capture_dir.stat().st_mode) == 0o700
+
+
+def test_capture_dir_pre_existing_with_wrong_permissions_is_tightened(tmp_path):
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir(mode=0o755)
+    os.chmod(capture_dir, 0o755)  # mkdir(mode=...) is clipped by umask; force it open first
+
+    _worker(lambda request: httpx.Response(200), capture_dir=capture_dir)
+
+    assert stat.S_IMODE(capture_dir.stat().st_mode) == 0o700
+
+
+def test_capture_write_failure_degrades_to_a_warning_not_a_crash(tmp_path, capsys):
+    # Fix (review): a populated capture dir used to crash the run mid-flow on
+    # the second O_EXCL write (per-process counter restarts at 1). The CLI
+    # now refuses a non-empty --capture dir up front; the worker itself must
+    # also never let one write failure kill the run.
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir()
+    (capture_dir / "0001-portal.html").write_text("leftover", encoding="utf-8")  # collides with the first write
+    unrecognized = (
+        '<html><body><a href="/sigaa/logar.do?dispatch=logOff">SAIR</a>'
+        "<p>unexpected maintenance page</p></body></html>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            return httpx.Response(200, text=unrecognized)
+        if path == "/sigaa/graduacao/matricula/extraordinaria/matricula_extraordinaria.jsf" and request.method == "GET":
+            return httpx.Response(200, text=unrecognized)
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    worker, _ = _worker(handler, capture_dir=capture_dir)
+    result = worker.run()  # must not raise
+
+    assert result.status == "error"
+    assert result.exit_code == 6
+    assert "CAPTURE_WARNING" in capsys.readouterr().err
+
+
 def test_capture_writes_numbered_files_with_private_permissions(tmp_path):
     capture_dir = tmp_path / "capture"
 
@@ -655,11 +775,11 @@ def test_capture_writes_numbered_files_with_private_permissions(tmp_path):
     assert result.status == "error"
     assert stat.S_IMODE(capture_dir.stat().st_mode) == 0o700
     files = sorted(p.name for p in capture_dir.iterdir())
-    assert files == ["01-portal.html", "02-search.html", "03-search-result.html"]
+    assert files == ["0001-portal.html", "0002-search.html", "0003-search-result.html"]
     for name in files:
         mode = stat.S_IMODE((capture_dir / name).stat().st_mode)
         assert mode == 0o600
-    assert (capture_dir / "02-search.html").read_text(encoding="utf-8") == _fixture("search.html")
+    assert (capture_dir / "0002-search.html").read_text(encoding="utf-8") == _fixture("search.html")
 
 
 def test_capture_is_diagnostic_only_and_never_changes_the_result(tmp_path):
@@ -681,3 +801,435 @@ def test_capture_is_diagnostic_only_and_never_changes_the_result(tmp_path):
     captured, _ = _worker(handler, capture_dir=tmp_path / "capture")
 
     assert plain.run() == captured.run()
+
+
+# =============================================================================
+# Part B: select -> prepare -> confirm -> verify (worker level, gated on Task 3
+# real evidence being genuinely absent -- see task-34-report.md's assumptions
+# section for what a real capture must still confirm about these shapes).
+# =============================================================================
+
+
+# --- dry-run: selects, prepares, never sends the confirmation POST ----------
+
+
+def test_dry_run_selects_and_prepares_but_never_sends_confirmation():
+    handler, state = _selection_and_confirmation_handler()
+    worker, requests = _worker(handler)
+    result = worker.run()
+
+    assert result.status == "prepared"
+    assert result.exit_code == 0
+    assert state["confirmation_posts"] == 0
+    extraordinaria_posts = [
+        r for r in requests
+        if r.method == "POST"
+        and r.url.path.split(";")[0].startswith("/sigaa/graduacao/matricula/extraordinaria/")
+    ]
+    assert len(extraordinaria_posts) == 2  # search + selection, never confirmation
+
+
+def test_prepared_stops_even_under_watch():
+    handler, _ = _selection_and_confirmation_handler()
+    worker, _ = _worker(handler, sleep=_never_sleep)
+    result = worker.run(watch=True, interval=20)
+    assert result.status == "prepared"
+
+
+# --- confirm: exactly one POST, happy path -----------------------------------
+
+
+def test_confirm_sends_exactly_one_confirmation_post_and_verifies_enrolled():
+    handler, state = _selection_and_confirmation_handler()
+    worker, _ = _worker(handler)
+    result = worker.run(confirm=True)
+
+    assert result.status == "enrolled"
+    assert result.exit_code == 0
+    assert result.message == "matrícula verificada"
+    assert state["confirmation_posts"] == 1
+
+
+def test_confirm_fields_are_filled_from_secrets_not_stored_on_the_parser_object():
+    handler, state = _selection_and_confirmation_handler()
+    worker, requests = _worker(handler, secrets={"password": "s3cr3t-pw", "birth_date": "01/02/2003"})
+    worker.run(confirm=True)
+
+    confirmation_posts = [
+        r for r in requests
+        if r.method == "POST"
+        and r.url.path.split(";")[0].startswith("/sigaa/graduacao/matricula/extraordinaria/")
+    ]
+    body = _body(confirmation_posts[2])
+    assert body["form:senha"] == "s3cr3t-pw"
+    assert body["form:dataNascimento"] == "01/02/2003"
+
+
+# --- the required scenario: a timeout inside the confirmation POST ----------
+
+
+def test_confirmation_timeout_goes_straight_to_verification_single_send():
+    handler, state = _selection_and_confirmation_handler(
+        confirmation_raises=True, verification_htmls=[_fixture("enrolled.html")]
+    )
+    worker, _ = _worker(handler)
+    result = worker.run(confirm=True)
+
+    assert state["confirmation_posts"] == 1
+    assert result.status == "enrolled"
+    assert result.exit_code == 0
+
+
+# --- 307/308 after the confirmation POST: no replay, straight to verify -----
+
+
+def test_redirect_after_confirmation_post_is_not_replayed():
+    redirect = httpx.Response(307, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+    handler, state = _selection_and_confirmation_handler(
+        confirmation_response=redirect, verification_htmls=[_fixture("enrolled.html")]
+    )
+    worker, requests = _worker(handler)
+    result = worker.run(confirm=True)
+
+    assert state["confirmation_posts"] == 1
+    assert result.status == "enrolled"
+    # never a second POST to the extraordinária endpoint (search + selection + confirmation = 3, no more)
+    extraordinaria_posts = [
+        r for r in requests
+        if r.method == "POST"
+        and r.url.path.split(";")[0].startswith("/sigaa/graduacao/matricula/extraordinaria/")
+    ]
+    assert len(extraordinaria_posts) == 3
+
+
+# --- explicit academic rejection: terminal, exit 3, never retried -----------
+
+
+def test_explicit_academic_rejection_is_terminal_and_skips_verification():
+    rejected = httpx.Response(200, text="<html><body><div class='erro'>Choque de horário com outra turma.</div></body></html>")
+    handler, state = _selection_and_confirmation_handler(confirmation_response=rejected)
+    worker, requests = _worker(handler, sleep=_never_sleep)
+    result = worker.run(confirm=True, watch=True, interval=20)
+
+    assert result.status == "rejected"
+    assert result.exit_code == 3
+    assert result.message == "choque de horário"
+    # no verification GET was ever attempted: only the one login-time portal GET
+    portal_gets = [
+        r for r in requests
+        if r.method == "GET" and r.url.path.split(";")[0] == "/sigaa/portais/discente/discente.jsf"
+    ]
+    assert len(portal_gets) == 1
+
+
+# --- already_enrolled: a message alone is never enough, needs proof ---------
+
+
+def test_already_matriculado_message_with_verified_bond_is_already_enrolled():
+    already = httpx.Response(200, text="<html><body><div class='info'>Você já está matriculado.</div></body></html>")
+    handler, state = _selection_and_confirmation_handler(
+        confirmation_response=already, verification_htmls=[_fixture("enrolled.html")]
+    )
+    worker, _ = _worker(handler)
+    result = worker.run(confirm=True)
+
+    assert result.status == "already_enrolled"
+    assert result.exit_code == 0
+
+
+def test_already_matriculado_message_without_proof_is_unknown_not_already_enrolled():
+    already = httpx.Response(200, text="<html><body><div class='info'>Você já está matriculado.</div></body></html>")
+    not_enrolled = "<html><body><a href='/sigaa/logar.do?dispatch=logOff'>SAIR</a><p>nada aqui</p></body></html>"
+    handler, state = _selection_and_confirmation_handler(
+        confirmation_response=already, verification_htmls=[not_enrolled, not_enrolled, not_enrolled]
+    )
+    worker, _ = _worker(handler, sleep=lambda delay: None)
+    result = worker.run(confirm=True)
+
+    assert result.status == "unknown"
+    assert result.exit_code == 4
+
+
+# --- verification: unavailable after 3 queries -> unknown/4, with backoff ---
+
+
+def test_verification_inconclusive_after_three_queries_is_unknown_with_backoff():
+    not_enrolled = "<html><body><a href='/sigaa/logar.do?dispatch=logOff'>SAIR</a><p>nada aqui</p></body></html>"
+    handler, state = _selection_and_confirmation_handler(
+        verification_htmls=[not_enrolled, not_enrolled, not_enrolled]
+    )
+    delays: list[float] = []
+    worker, _ = _worker(handler, sleep=delays.append)
+    result = worker.run(confirm=True)
+
+    assert result.status == "unknown"
+    assert result.exit_code == 4
+    assert delays == [10.0, 20.0]  # 2 backoff waits between 3 queries, never a 4th query
+    assert state["confirmation_posts"] == 1  # unknown never re-sends the confirmation
+
+
+# --- a session bounce during verification: relogin, retry the SAME query ---
+
+
+def test_session_bounce_during_verification_relogins_and_retries_only_verification():
+    handler, state = _selection_and_confirmation_handler(
+        verification_htmls=[_fixture("login.html"), _fixture("portal.html")]
+    )
+    worker, requests = _worker(handler)
+    result = worker.run(confirm=True)
+
+    assert result.status == "enrolled"  # the 4th portal GET (after relogin) falls through to the default enrolled.html
+    assert state["confirmation_posts"] == 1  # the session bounce never triggers a second confirmation
+    login_gets = [r for r in requests if r.url.path.split(";")[0] == "/sigaa/verTelaLogin.do"]
+    assert len(login_gets) == 2  # the initial login + exactly one relogin during verification
+
+
+# --- MATRICULADO for a different turma is not proof of enrollment ----------
+
+
+def test_verification_matriculado_in_a_different_turma_is_not_enrolled():
+    other_turma = (
+        "<html><body><a href='/sigaa/logar.do?dispatch=logOff'>SAIR</a>"
+        "<table class='formulario'><tr><th>Componente</th><th>Turma</th><th>Situação</th><th>Período</th></tr>"
+        "<tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td><td>01</td><td>MATRICULADO</td><td>2026.2</td></tr>"
+        "</table></body></html>"
+    )
+    handler, state = _selection_and_confirmation_handler(
+        verification_htmls=[other_turma, other_turma, other_turma]
+    )
+    worker, _ = _worker(handler, sleep=lambda delay: None)
+    result = worker.run(confirm=True)
+
+    assert result.status == "unknown"
+
+
+# --- a consumed preparation cannot be confirmed twice ------------------------
+
+
+def test_prepared_confirmation_cannot_be_sent_twice():
+    handler, state = _selection_and_confirmation_handler()
+    worker, requests = _worker(handler)
+
+    login_response = worker._session.login()
+    opened = worker._open(login_response.text, str(login_response.url))
+    search_response = worker._follow(worker._session.post(opened))
+    classified = worker._classify_search(search_response.text, str(search_response.url))
+    prepared = worker._prepare(classified, search_response.text, str(search_response.url))
+
+    worker._confirm(prepared)
+    assert state["confirmation_posts"] == 1
+    requests_before_second_call = len(requests)
+    with pytest.raises(AssertionError, match="already sent"):
+        worker._confirm(prepared)
+    # the guard fires before any second I/O: no new HTTP request at all, not
+    # even one the transport itself would have rejected.
+    assert len(requests) == requests_before_second_call
+
+
+# --- missing/unresolvable confirmation secret: exit 5, BEFORE sending -------
+
+
+def test_confirm_fails_with_exit_five_before_sending_when_secret_unresolvable():
+    from sigaa.ufcg import UFCGError as _UFCGError
+
+    handler, state = _selection_and_confirmation_handler()
+    requests: list[httpx.Request] = []
+
+    def recording_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return handler(request)
+
+    client = httpx.Client(transport=httpx.MockTransport(recording_handler), follow_redirects=False)
+    session = UFCGSession("jucag", lambda: "s3cr3t", client=client)
+
+    def missing_secret(kind: str) -> str:
+        raise _UFCGError(f"UFCG {kind} not configured", category="auth")
+
+    worker = ExtraordinaryWorker(session, missing_secret)
+    result = worker.run(confirm=True)
+
+    assert result.status == "error"
+    assert result.exit_code == 5
+    assert state["confirmation_posts"] == 0
+
+
+# --- missing/incorrect confirmation form data: fail closed -------------------
+
+
+def test_prepare_fails_closed_when_confirmation_form_has_no_password_field():
+    broken = (
+        "<html><body>1109103 Turma 02 <form name='form'>"
+        "<input type='hidden' name='javax.faces.ViewState' value='x'></form></body></html>"
+    )
+    handler, _ = _selection_and_confirmation_handler(confirmation_html=broken)
+    worker, _ = _worker(handler)
+    result = worker.run()
+
+    assert result.status == "error"
+    assert result.exit_code == 6
+
+
+def test_prepare_fails_closed_when_confirmation_page_does_not_match_target():
+    mismatched = _fixture("confirmation.html").replace("1109103", "9999999")
+    handler, _ = _selection_and_confirmation_handler(confirmation_html=mismatched)
+    worker, _ = _worker(handler)
+    result = worker.run()
+
+    assert result.status == "error"
+    assert result.exit_code == 6
+
+
+# --- ambiguous results rows: fail closed, no fallback -----------------------
+
+
+def test_worker_ambiguous_target_rows_is_a_fatal_error():
+    ambiguous = """
+    <table class="formulario">
+      <tr><th colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr><th>Turma</th><th>Vagas</th></tr>
+      <tr><td>Turma 02</td><td>1 vaga</td><td><input type="submit" name="form:sel1" value="Selecionar"></td></tr>
+      <tr><td>Turma 02</td><td>1 vaga</td><td><input type="submit" name="form:sel2" value="Selecionar"></td></tr>
+    </table>
+    """
+    handler, _ = _selection_and_confirmation_handler(results_html=ambiguous)
+    worker, _ = _worker(handler)
+    result = worker.run()
+
+    assert result.status == "error"
+    assert result.exit_code == 6
+
+
+# --- _is_available: unknown vacancy but a trustworthy enabled control -------
+
+
+def test_is_available_true_on_unknown_vacancy_with_an_enabled_control():
+    row = ExtraordinaryClass(
+        component_code="1109103", class_token="2", class_label="Turma 02",
+        vacancies=None, schedule_raw=None, room=None, selection_fields=(("a", "b"),),
+    )
+    assert _is_available(row) is True
+
+
+def test_is_available_false_on_unknown_vacancy_without_any_control():
+    row = ExtraordinaryClass(
+        component_code="1109103", class_token="2", class_label="Turma 02",
+        vacancies=None, schedule_raw=None, room=None, selection_fields=(),
+    )
+    assert _is_available(row) is False
+
+
+def test_is_available_false_on_explicit_zero_even_with_a_stray_control():
+    row = ExtraordinaryClass(
+        component_code="1109103", class_token="2", class_label="Turma 02",
+        vacancies=0, schedule_raw=None, room=None, selection_fields=(("a", "b"),),
+    )
+    assert _is_available(row) is False
+
+
+# --- no_vacancy / target_not_found: watchable, unlike prepared/rejected -----
+
+
+def test_watch_polls_on_no_vacancy():
+    no_vacancy = """
+    <table class="formulario">
+      <tr><th colspan="4">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr><th>Turma</th><th>Horário</th><th>Vagas</th><th>Local</th></tr>
+      <tr><td>Turma 02</td><td>246810N34</td><td>0 vaga</td><td>CAA-202</td></tr>
+    </table>
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            return httpx.Response(200, text=_fixture("portal.html"))
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            return httpx.Response(200, text=no_vacancy)
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    delays: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 2:
+            raise KeyboardInterrupt
+
+    worker, _ = _worker(handler, sleep=fake_sleep, now=lambda: 0.0)
+    with pytest.raises(KeyboardInterrupt):
+        worker.run(watch=True, interval=20)
+
+    assert delays == [20, 20]
+
+
+def test_watch_polls_on_target_not_found():
+    absent = """
+    <table class="formulario">
+      <tr><th colspan="4">1108021 - PROGRAMAÇÃO I (DISCIPLINA)</th></tr>
+      <tr><th>Turma</th><th>Horário</th><th>Vagas</th><th>Local</th></tr>
+      <tr><td>Turma 01</td><td>246810N12</td><td>5 vagas</td><td>CAA-100</td></tr>
+    </table>
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.split(";")[0]
+        if path == "/sigaa/verTelaLogin.do":
+            return httpx.Response(200, text=_fixture("login.html"))
+        if path.startswith("/sigaa/logar.do"):
+            return httpx.Response(302, headers={"location": "/sigaa/portais/discente/discente.jsf"})
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "GET":
+            return httpx.Response(200, text=_fixture("portal.html"))
+        if path == "/sigaa/portais/discente/discente.jsf" and request.method == "POST":
+            return httpx.Response(200, text=_fixture("search.html"))
+        if path.startswith("/sigaa/graduacao/matricula/extraordinaria/") and request.method == "POST":
+            return httpx.Response(200, text=absent)
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    delays: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 1:
+            raise KeyboardInterrupt
+
+    worker, _ = _worker(handler, sleep=fake_sleep, now=lambda: 0.0)
+    with pytest.raises(KeyboardInterrupt):
+        worker.run(watch=True, interval=20)
+
+    assert delays == [20]
+
+
+# --- capture also records results / confirmation / verification renders ----
+
+
+def test_capture_records_results_confirmation_and_verification(tmp_path):
+    handler, _ = _selection_and_confirmation_handler()
+    capture_dir = tmp_path / "capture"
+    worker, _ = _worker(handler, capture_dir=capture_dir)
+    worker.run(confirm=True)
+
+    files = sorted(p.name for p in capture_dir.iterdir())
+    assert any("search-result" in f for f in files)
+    assert any(f.endswith("-confirmation.html") for f in files)
+    assert any("confirmation-result" in f for f in files)
+    assert any("verification" in f for f in files)
+
+
+# --- secrets never leak anywhere in the confirm path -------------------------
+
+
+def test_confirm_path_never_leaks_secrets(capsys):
+    handler, _ = _selection_and_confirmation_handler()
+    worker, _ = _worker(handler, secrets={"password": "S3ntinelPW", "birth_date": "S3ntinelBD"})
+    result = worker.run(confirm=True)
+
+    err = capsys.readouterr().err
+    assert "S3ntinelPW" not in err
+    assert "S3ntinelBD" not in err
+    assert "S3ntinelPW" not in result.message
+    assert "S3ntinelPW" not in repr(result)
+    assert "S3ntinelBD" not in result.message

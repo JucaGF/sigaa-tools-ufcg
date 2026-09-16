@@ -1,16 +1,26 @@
 from pathlib import Path
 
+import pytest
 from bs4 import BeautifulSoup
 
 from sigaa.parsers.matricula_extraordinaria import (
+    AmbiguousSelectionError,
+    ExtraordinaryClass,
     FormAction,
     build_form_payload,
+    classify_message,
+    confirmation_action,
+    confirmation_identity_fields,
     is_authenticated_portal,
+    is_enrolled,
     is_period_closed,
     login_action,
     menu_action,
     normalize_class,
+    parse_classes,
     search_action,
+    select_target,
+    selection_action,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ufcg"
@@ -228,3 +238,284 @@ def test_is_period_closed_false_on_unrecognized_render_still_on_the_flow_url():
     # not-yet-modeled results page) must not be misclassified as closed.
     html = "<html><body><div id='resultados'>...</div></body></html>"
     assert is_period_closed(html, SEARCH_URL) is False
+
+
+# --- select_target: exact component + turma, no fallback ---------------------
+
+
+def test_selection_has_no_class_one_fallback():
+    row = ExtraordinaryClass(
+        component_code='1109103', class_token='1', class_label='01',
+        vacancies=8, schedule_raw=None, room=None, selection_fields=(),
+    )
+    assert select_target([row]) is None
+
+
+# --- parse_classes: real search form is confirmed, results table is a hypothesis ---
+
+
+def test_parse_classes_maps_headers_by_th_not_position():
+    rows = parse_classes(_fixture("results.html"))
+    assert len(rows) == 2
+    turma02 = next(r for r in rows if r.class_token == "2")
+    assert turma02.component_code == "1109103"
+    assert turma02.class_label == "Turma 02"
+    assert turma02.vacancies == 2
+    assert turma02.schedule_raw == "246810N34"
+    assert turma02.room == "CAA-202"
+    assert turma02.selection_fields == (("form:selecionarTurma_1", "postback-turma-02"),)
+
+
+def test_parse_classes_turma_without_vacancy_or_control_has_none_selection():
+    rows = parse_classes(_fixture("results.html"))
+    turma01 = next(r for r in rows if r.class_token == "1")
+    assert turma01.vacancies == 0
+    assert turma01.selection_fields == ()
+
+
+def test_parse_classes_raises_on_unrecognized_dom():
+    with pytest.raises(ValueError):
+        parse_classes("<html><body><div id='resultados'>unmodeled</div></body></html>")
+
+
+def test_parse_classes_absent_values_are_none_not_zero():
+    html = """
+    <table class="formulario">
+      <tr><th colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr><th>Turma</th><th>Vagas</th></tr>
+      <tr><td>Turma 02</td><td>-</td></tr>
+    </table>
+    """
+    rows = parse_classes(html)
+    assert rows[0].vacancies is None
+    assert rows[0].schedule_raw is None
+    assert rows[0].room is None
+
+
+def test_parse_classes_headers_reordered_still_map_correctly():
+    html = """
+    <table class="formulario">
+      <tr><th colspan="4">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr><th>Local</th><th>Vagas</th><th>Turma</th><th>Horário</th></tr>
+      <tr><td>CAA-202</td><td>3 vagas</td><td>Turma 02</td><td>246810N34</td></tr>
+    </table>
+    """
+    rows = parse_classes(html)
+    assert rows[0].room == "CAA-202"
+    assert rows[0].vacancies == 3
+    assert rows[0].class_token == "2"
+    assert rows[0].schedule_raw == "246810N34"
+
+
+def test_parse_classes_component_absent_from_results_has_no_target():
+    # A recognized table for a *different* component (SIGAA found no match
+    # for the searched code): rows are still returned (diagnostic), but
+    # select_target must find nothing for 1109103/02.
+    html = """
+    <table class="formulario">
+      <tr><th colspan="4">1108021 - PROGRAMAÇÃO I (DISCIPLINA)</th></tr>
+      <tr><th>Turma</th><th>Horário</th><th>Vagas</th><th>Local</th></tr>
+      <tr><td>Turma 01</td><td>246810N12</td><td>5 vagas</td><td>CAA-100</td></tr>
+    </table>
+    """
+    assert select_target(parse_classes(html)) is None
+
+
+def test_parse_classes_recognized_table_with_zero_rows_is_empty():
+    html = """
+    <table class="formulario">
+      <tr><th>Turma</th><th>Horário</th><th>Vagas</th><th>Local</th></tr>
+    </table>
+    """
+    assert parse_classes(html) == []
+
+
+def test_parse_classes_only_turma_one_present():
+    html = """
+    <table class="formulario">
+      <tr><th colspan="4">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr><th>Turma</th><th>Horário</th><th>Vagas</th><th>Local</th></tr>
+      <tr><td>Turma 01</td><td>246810N12</td><td>5 vagas</td><td>CAA-204</td></tr>
+    </table>
+    """
+    rows = parse_classes(html)
+    assert select_target(rows) is None
+
+
+def test_parse_classes_jsfcljs_link_selection_control():
+    html = """
+    <table class="formulario">
+      <tr><th colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr><th>Turma</th><th>Vagas</th></tr>
+      <tr><td>Turma 02</td><td>1 vaga</td>
+        <td><a href="javascript:jsfcljs(document.forms['form'],'selecionar:2,k2:v2','')">Selecionar</a></td>
+      </tr>
+    </table>
+    """
+    rows = parse_classes(html)
+    assert rows[0].selection_fields == (("selecionar", "2"), ("k2", "v2"))
+
+
+def test_parse_classes_submit_button_selection_control():
+    html = """
+    <table class="formulario">
+      <tr><th colspan="2">1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I (DISCIPLINA)</th></tr>
+      <tr><th>Turma</th><th>Vagas</th></tr>
+      <tr><td>Turma 02</td><td>1 vaga</td>
+        <td><input type="submit" name="form:selecionarTurma02" value="Selecionar"></td>
+      </tr>
+    </table>
+    """
+    rows = parse_classes(html)
+    assert rows[0].selection_fields == (("form:selecionarTurma02", "Selecionar"),)
+
+
+# --- select_target: ambiguity fails closed --------------------------------
+
+
+def test_select_target_raises_on_ambiguous_duplicate_rows():
+    row = ExtraordinaryClass(
+        component_code="1109103", class_token="2", class_label="Turma 02",
+        vacancies=1, schedule_raw=None, room=None, selection_fields=(("a", "b"),),
+    )
+    with pytest.raises(AmbiguousSelectionError):
+        select_target([row, row])
+
+
+def test_select_target_requires_both_component_and_turma():
+    other_component = ExtraordinaryClass(
+        component_code="1108021", class_token="2", class_label="Turma 02",
+        vacancies=5, schedule_raw=None, room=None, selection_fields=(("a", "b"),),
+    )
+    assert select_target([other_component]) is None
+
+
+def test_select_target_picks_the_positive_vacancy_row():
+    rows = parse_classes(_fixture("results.html"))
+    target = select_target(rows)
+    assert target is not None
+    assert target.class_token == "2"
+    assert target.vacancies == 2
+
+
+# --- selection_action: rebuild from the row's own form ---------------------
+
+
+def test_selection_action_rebuilds_current_hidden_fields_plus_row_postback():
+    rows = parse_classes(_fixture("results.html"))
+    target = select_target(rows)
+    action = selection_action(_fixture("results.html"), SEARCH_URL, target)
+    fields = dict(action.fields)
+    assert fields["javax.faces.ViewState"] == "render-fake-0003"
+    assert fields["form:selecionarTurma_1"] == "postback-turma-02"
+    assert action.action == SEARCH_URL
+
+
+# --- confirmation_action / confirmation_identity_fields ---------------------
+
+
+def test_confirmation_identity_fields_are_located_dynamically_with_empty_values():
+    html = _fixture("confirmation.html")
+    names = confirmation_identity_fields(html)
+    assert names["password"] == "form:senha"
+    assert names["birth_date"] == "form:dataNascimento"
+    action = confirmation_action(html, SEARCH_URL)
+    fields = dict(action.fields)
+    assert fields["form:senha"] == ""
+    assert fields["form:dataNascimento"] == ""
+    assert fields["javax.faces.ViewState"] == "render-fake-0004"
+    # secrets are never stored: FormAction repr never includes field values
+    assert "senha" not in repr(action) or "topsecret" not in repr(action)
+
+
+def test_confirmation_action_without_password_field_fails_closed():
+    html = "<html><body><form name='form'><input type='hidden' name='javax.faces.ViewState' value='x'></form></body></html>"
+    with pytest.raises(ValueError):
+        confirmation_action(html, SEARCH_URL)
+
+
+def test_confirmation_action_missing_entirely_fails_closed():
+    with pytest.raises(ValueError):
+        confirmation_action("<html><body>nothing here</body></html>", SEARCH_URL)
+
+
+# --- is_enrolled: same row, same semester -----------------------------------
+
+
+def test_is_enrolled_true_for_target_component_turma_and_semester():
+    assert is_enrolled(_fixture("enrolled.html")) is True
+
+
+def test_is_enrolled_false_for_different_component():
+    html = """
+    <table class="formulario">
+      <tr><th>Componente</th><th>Turma</th><th>Situação</th><th>Período</th></tr>
+      <tr><td>1108021 - PROGRAMAÇÃO I</td><td>02</td><td>MATRICULADO</td><td>2026.2</td></tr>
+    </table>
+    """
+    assert is_enrolled(html) is False
+
+
+def test_is_enrolled_false_for_different_turma():
+    html = """
+    <table class="formulario">
+      <tr><th>Componente</th><th>Turma</th><th>Situação</th><th>Período</th></tr>
+      <tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td><td>01</td><td>MATRICULADO</td><td>2026.2</td></tr>
+    </table>
+    """
+    assert is_enrolled(html) is False
+
+
+def test_is_enrolled_false_on_explicit_negation():
+    html = """
+    <table class="formulario">
+      <tr><th>Componente</th><th>Turma</th><th>Situação</th><th>Período</th></tr>
+      <tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td><td>02</td><td>NÃO MATRICULADO</td><td>2026.2</td></tr>
+    </table>
+    """
+    assert is_enrolled(html) is False
+
+
+def test_is_enrolled_false_on_success_message_without_a_bond_row():
+    html = "<html><body><div class='info'>Matrícula realizada com sucesso.</div></body></html>"
+    assert is_enrolled(html) is False
+
+
+def test_is_enrolled_false_on_historical_semester():
+    html = """
+    <table class="formulario">
+      <tr><th>Componente</th><th>Turma</th><th>Situação</th><th>Período</th></tr>
+      <tr><td>1109103 - CÁLCULO DIFERENCIAL E INTEGRAL I</td><td>02</td><td>MATRICULADO</td><td>2025.1</td></tr>
+    </table>
+    """
+    assert is_enrolled(html) is False
+
+
+# --- classify_message: SPEC §22 categories, fixed diagnostics --------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Não há vaga disponível para esta turma.", "sem vaga"),
+        ("Você já está matriculado neste componente.", "já matriculado"),
+        ("Choque de horário com outra turma já matriculada.", "choque de horário"),
+        ("Pré-requisito não cumprido para este componente.", "pré-requisito ou correquisito"),
+        ("Limite de carga horária do semestre excedido.", "limite de carga horária"),
+        ("Este componente não permite matrícula on-line.", "matrícula on-line não permitida"),
+        ("O período de matrícula extraordinária encerrado.", "período fechado"),
+        ("Senha incorreta, tente novamente.", "dados de confirmação incorretos"),
+        ("Sua sessão expirou, faça login novamente.", "sessão expirada"),
+        ("Sistema indisponível, tente novamente mais tarde.", "indisponibilidade do sistema"),
+    ],
+)
+def test_classify_message_categories(text, expected):
+    html = f"<html><body><div class='erro'>{text}</div></body></html>"
+    assert classify_message(html) == expected
+
+
+def test_classify_message_unknown_never_echoes_the_body():
+    html = "<html><body><div class='erro'>Um erro totalmente novo e inesperado.</div></body></html>"
+    result = classify_message(html)
+    assert result == "resposta desconhecida"
+    assert "inesperado" not in result

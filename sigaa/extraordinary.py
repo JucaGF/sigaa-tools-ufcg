@@ -1,30 +1,34 @@
-"""UFCG matrícula extraordinária flow: login -> open -> search, with polling.
+"""UFCG matrícula extraordinária flow: login -> open -> search -> select ->
+confirm -> verify, with polling.
 
 Phase 1 of SPEC §25 covered the single dry-run attempt (authenticate, open the
-extraordinária, submit the search). This slice adds the sequential polling
-worker on top of it: `run(watch=True, ...)` reuses the same session across
-cycles and loops only on `period_closed` and allowed transient recovery
-(network errors, 429/503 with `Retry-After`, and a mid-flow session bounce),
-with the SPEC §18 backoff ladder. It does not select a turma, confirm, or
-verify a post-condition -- those need a real capture (SPEC §5.3) and stay out
-of scope until a later task. `--confirm` is accepted for contract
-compatibility but is otherwise inert: the CLI already refuses it before a
-worker is ever built (SPEC §25 phase 1 gate), and that gate is NOT lifted by
-this task regardless of anything a document might claim -- mutation stays
-disabled until a real results/confirmation capture exists.
+extraordinária, submit the search). This module adds: the sequential polling
+worker (`run(watch=True, ...)` reuses the same session across cycles and
+loops only on `period_closed`/`target_not_found`/`no_vacancy` and allowed
+transient recovery, with the SPEC §18 backoff ladder); turma selection and
+dry-run preparation (SPEC §14, terminal `prepared`/0, never serialized); and
+confirmation + post-condition verification at the worker level (SPEC §15-16),
+gated entirely behind `confirm=True` passed directly to `ExtraordinaryWorker`.
+
+`--confirm` on the CLI is a SEPARATE decision from this module's own confirm
+support: the CLI refuses `--confirm` unconditionally (exit 5, SPEC §25 phase 1
+gate) regardless of what this module can do -- enabling it is a decision the
+repo owner makes at the permission layer, not something this module lifts.
 
 `--capture DIR` is a diagnostic-only side channel (SPEC §20): every HTML
 render the flow receives is also written to numbered files under `DIR`. It
-never changes a request, a payload, or a classification.
+never changes a request, a payload, or a classification. A capture write
+failure degrades to a logged warning; it never aborts the run.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -33,8 +37,22 @@ from urllib.parse import urljoin
 
 import httpx
 
-from .parsers.matricula_extraordinaria import FormAction, is_period_closed, menu_action, search_action
-from .ufcg import _LOGIN_FORM_MARKER, _REDIRECT_STATUSES, DIRECT_URL, UFCGError, UFCGSession
+from .parsers.matricula_extraordinaria import (
+    AmbiguousSelectionError,
+    ExtraordinaryClass,
+    FormAction,
+    classify_message,
+    confirmation_action,
+    confirmation_identity_fields,
+    is_enrolled,
+    is_period_closed,
+    menu_action,
+    parse_classes,
+    search_action,
+    select_target,
+    selection_action,
+)
+from .ufcg import _LOGIN_FORM_MARKER, _REDIRECT_STATUSES, DIRECT_URL, PORTAL_URL, UFCGError, UFCGSession
 
 COMPONENT_CODE = "1109103"
 CLASS_LABEL = "02"
@@ -42,7 +60,19 @@ CLASS_LABEL = "02"
 _RESULTS_CAPTURE_MESSAGE = "captura de resultados necessária"
 _NO_SEARCH_FORM_MESSAGE = "SIGAA did not present the matrícula extraordinária search form"
 _PERIOD_CLOSED_MESSAGE = "matrícula extraordinária period is not open"
-_SESSION_EXPIRED_MESSAGE = "SIGAA session expired during search; the retry also expired"
+# Generalized: this bounce can happen during the OPEN phase (menu/direct
+# endpoint) just as easily as during SEARCH -- a --watch session is held open
+# for hours and either phase can be the one that finds it dead.
+_SESSION_EXPIRED_MESSAGE = "SIGAA session expired; the retry also expired"
+_TARGET_NOT_FOUND_MESSAGE = "componente 1109103 turma 02 não encontrado nos resultados da busca"
+_NO_VACANCY_MESSAGE = "turma 02 sem vaga disponível no momento"
+_AMBIGUOUS_TARGET_MESSAGE = "resultados da extraordinária ambíguos para o alvo (duas linhas equivalentes)"
+_SELECTION_UNRECOGNIZED_MESSAGE = "SIGAA did not present a recognizable selection control for turma 02"
+_CONFIRMATION_MISMATCH_MESSAGE = "confirmation page does not confirm the same component/turma"
+_CONFIRMATION_UNRECOGNIZED_MESSAGE = "SIGAA did not present a recognizable confirmation form"
+_PREPARED_MESSAGE = "matrícula preparada (dry-run); re-execute com --confirm para enviar"
+_ENROLLED_MESSAGE = "matrícula verificada"
+_UNKNOWN_MESSAGE = "confirmação enviada mas a verificação foi inconclusiva"
 
 # category -> (status, exit_code), SPEC §24 / controller ruling 1.
 _CATEGORY_TO_RESULT = {
@@ -54,6 +84,25 @@ _CATEGORY_TO_RESULT = {
 # Categories `run(watch=True, ...)` is allowed to retry with backoff instead of
 # ending the run; anything else (auth, protocol) is terminal even with watch.
 _TRANSIENT_RETRY_CATEGORIES = frozenset({"network", "session_expired"})
+# Statuses `run(watch=True, ...)` polls on: the target may simply not exist
+# yet. `prepared` is deliberately NOT here (SPEC: stop even under --watch).
+_WATCHABLE_STATUSES = frozenset({"period_closed", "target_not_found", "no_vacancy"})
+
+# SPEC §22 categories that are an explicit, terminal academic refusal of THIS
+# confirmation attempt -- `classify_message` returns them verbatim as
+# `result.message`. "já matriculado" is handled separately (needs proof, SPEC
+# contracts.md); the others below never need a second POST to know they're final.
+_TERMINAL_REJECTION_CATEGORIES = frozenset({
+    "sem vaga",
+    "choque de horário",
+    "pré-requisito ou correquisito",
+    "limite de carga horária",
+    "matrícula on-line não permitida",
+    "dados de confirmação incorretos",
+})
+
+_VERIFICATION_BACKOFF = (10.0, 20.0)
+_MAX_VERIFICATION_QUERIES = 3
 
 _SESSION_EXPIRED = object()  # internal sentinel: `_attempt`/`_open` -> "reconstruct once" signal
 
@@ -67,6 +116,22 @@ class RunResult:
     status: str
     message: str
     exit_code: int
+
+
+@dataclass
+class _PreparedConfirmation:
+    """A validated-but-unsent confirmation, in memory only for one attempt.
+
+    Never serialized, never reused after relogin (a fresh `_attempt()` always
+    builds a fresh one). `sent` is set exactly once, before the confirmation
+    POST is issued, and guards against ever sending a second one for the same
+    prepared attempt.
+    """
+
+    action: FormAction
+    target: ExtraordinaryClass
+    identity_names: dict[str, str] = field(repr=False)  # {'password' | 'birth_date': field name}
+    sent: bool = False
 
 
 class ExtraordinaryWorker:
@@ -88,23 +153,27 @@ class ExtraordinaryWorker:
         self._capture_dir = Path(capture_dir) if capture_dir is not None else None
         self._capture_count = 0
         if self._capture_dir is not None:
-            # 0700 up front, no window where the directory is more permissive.
-            self._capture_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(self._capture_dir, 0o700)
+            existed = self._capture_dir.exists()
+            # 0700 at creation time -- umask only clears bits, so this leaves
+            # no window where the directory is more permissive. A directory
+            # that already existed (permissions we don't control) is tightened
+            # explicitly; a freshly created one needs no further chmod.
+            self._capture_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if existed:
+                os.chmod(self._capture_dir, 0o700)
 
     def run(self, *, confirm: bool = False, watch: bool = False, interval: float = 20) -> RunResult:
-        del confirm  # dry-run only until a real results/confirmation capture unlocks mutation.
         try:
-            return self._run(watch, interval)
+            return self._run(confirm, watch, interval)
         finally:
             if self._capture_dir is not None:
                 _log("CAPTURED", files=self._capture_count, dir=self._capture_dir)
 
-    def _run(self, watch: bool, interval: float) -> RunResult:
+    def _run(self, confirm: bool, watch: bool, interval: float) -> RunResult:
         failures = 0
         while True:
             try:
-                result = self._cycle()
+                result = self._cycle(confirm)
             except UFCGError as exc:
                 if watch and exc.category in _TRANSIENT_RETRY_CATEGORIES:
                     failures += 1
@@ -127,26 +196,26 @@ class ExtraordinaryWorker:
                 self._sleep(retry_delay(None, failures, interval, self._now()))
                 continue
 
-            if watch and result.status == "period_closed":
+            if watch and result.status in _WATCHABLE_STATUSES:
                 # Healthy response: step the backoff back down one notch.
                 failures = max(0, failures - 1)
                 delay = interval if failures == 0 else retry_delay(None, failures, interval, self._now())
                 self._sleep(delay)
                 continue
 
-            return result  # terminal even with watch: any other status.
+            return result  # terminal even with watch: any other status (incl. "prepared").
 
-    def _cycle(self) -> RunResult | object:
+    def _cycle(self, confirm: bool) -> RunResult | object:
         """One attempt, reconstructed at most once on a mid-flow session bounce
         (contracts.md: no more than one reconstruction per attempt before the
         transient outcome is handed back to the poller).
         """
-        result = self._attempt()
+        result = self._attempt(confirm)
         if result is _SESSION_EXPIRED:
-            result = self._attempt()
+            result = self._attempt(confirm)
         return result
 
-    def _attempt(self) -> RunResult | object:
+    def _attempt(self, confirm: bool) -> RunResult | object:
         response = self._session.login()
         self._capture("portal", response.text)
         _log("AUTHENTICATED")
@@ -158,7 +227,18 @@ class ExtraordinaryWorker:
         _log("SEARCHING", **{"component": COMPONENT_CODE, "class": CLASS_LABEL})
         response = self._follow(self._session.post(opened))
         self._capture("search-result", response.text)
-        return self._classify_search(response.text, str(response.url))
+        classified = self._classify_search(response.text, str(response.url))
+        if not isinstance(classified, ExtraordinaryClass):
+            return classified  # RunResult (terminal/watchable) or _SESSION_EXPIRED
+
+        prepared = self._prepare(classified, response.text, str(response.url))
+        if not isinstance(prepared, _PreparedConfirmation):
+            return prepared  # RunResult or _SESSION_EXPIRED
+
+        if not confirm:
+            return RunResult("prepared", _PREPARED_MESSAGE, 0)
+        _log("CONFIRMING")
+        return self._confirm(prepared)
 
     def _open(self, portal_html: str, portal_url: str) -> FormAction | RunResult | object:
         """SPEC §8.3: prefer the menu postback; fall back to the direct endpoint."""
@@ -186,25 +266,149 @@ class ExtraordinaryWorker:
         _log("FATAL_ERROR", reason="no_search_form")
         return RunResult("error", _NO_SEARCH_FORM_MESSAGE, 6)
 
-    def _classify_search(self, html: str, url: str) -> RunResult | object:
+    def _classify_search(self, html: str, url: str) -> RunResult | ExtraordinaryClass | object:
         if _is_login_form_render(html):
             return _SESSION_EXPIRED
         if is_period_closed(html, url):
             _log("PERIOD_CLOSED")
             return RunResult("period_closed", _PERIOD_CLOSED_MESSAGE, 2)
-        _log("FATAL_ERROR", reason="results_capture_needed")
-        return RunResult("error", _RESULTS_CAPTURE_MESSAGE, 6)
+        try:
+            rows = parse_classes(html)
+        except ValueError:
+            _log("FATAL_ERROR", reason="results_capture_needed")
+            return RunResult("error", _RESULTS_CAPTURE_MESSAGE, 6)
+        try:
+            target = select_target(rows)
+        except AmbiguousSelectionError:
+            _log("FATAL_ERROR", reason="ambiguous_target")
+            return RunResult("error", _AMBIGUOUS_TARGET_MESSAGE, 6)
+        if target is None:
+            _log("TARGET_UNAVAILABLE", reason="target_not_found")
+            return RunResult("target_not_found", _TARGET_NOT_FOUND_MESSAGE, 2)
+        if not _is_available(target):
+            _log("TARGET_UNAVAILABLE", reason="no_vacancy")
+            return RunResult("no_vacancy", _NO_VACANCY_MESSAGE, 2)
+        _log("TARGET_FOUND", vacancies=target.vacancies)
+        return target
+
+    def _prepare(
+        self, target: ExtraordinaryClass, results_html: str, results_url: str
+    ) -> RunResult | _PreparedConfirmation | object:
+        """SPEC §14: reach the confirmation form, validate it, never send it here."""
+        _log("PREPARING")
+        try:
+            select_form = selection_action(results_html, results_url, target)
+        except ValueError:
+            _log("FATAL_ERROR", reason="selection_form_unrecognized")
+            return RunResult("error", _SELECTION_UNRECOGNIZED_MESSAGE, 6)
+        response = self._follow(self._session.post(select_form))
+        self._capture("confirmation", response.text)
+        if _is_login_form_render(response.text):
+            return _SESSION_EXPIRED
+        if not _confirmation_matches_target(response.text, target):
+            _log("FATAL_ERROR", reason="confirmation_target_mismatch")
+            return RunResult("error", _CONFIRMATION_MISMATCH_MESSAGE, 6)
+        try:
+            action = confirmation_action(response.text, str(response.url))
+            identity_names = confirmation_identity_fields(response.text)
+        except ValueError:
+            _log("FATAL_ERROR", reason="confirmation_form_unrecognized")
+            return RunResult("error", _CONFIRMATION_UNRECOGNIZED_MESSAGE, 6)
+        _log("PREPARED")
+        return _PreparedConfirmation(action=action, target=target, identity_names=identity_names)
+
+    def _confirm(self, prepared: _PreparedConfirmation) -> RunResult:
+        """SPEC §15: resolve secrets, send exactly once, then only verify."""
+        try:
+            secret_values = {kind: self._confirmation_secret(kind) for kind in prepared.identity_names}
+        except UFCGError as exc:
+            _log("FATAL_ERROR", reason="confirmation_secret_unavailable")
+            return RunResult("error", str(exc), 5)
+
+        name_to_kind = {name: kind for kind, name in prepared.identity_names.items()}
+        filled_fields = tuple(
+            (name, secret_values[name_to_kind[name]]) if name in name_to_kind else (name, value)
+            for name, value in prepared.action.fields
+        )
+        action = FormAction(prepared.action.action, filled_fields)
+
+        if prepared.sent:
+            raise AssertionError("confirmation already sent for this prepared attempt")
+        prepared.sent = True  # set before the I/O; no exception may reopen this confirmation
+        try:
+            response = self._session.post(action)
+        except UFCGError:
+            response = None
+        # from here: only the verification query and its own recovery -- a
+        # 30x, a timeout or an unexpected status all fall through the same way.
+
+        category = None
+        if response is not None and 200 <= response.status_code < 300:
+            self._capture("confirmation-result", response.text)
+            category = classify_message(response.text)
+            if category in _TERMINAL_REJECTION_CATEGORIES:
+                _log("REJECTED", reason=category)
+                return RunResult("rejected", category, 3)
+
+        result = self._verify(prepared.target)
+        if category == "já matriculado" and result.status == "enrolled":
+            # A message alone is never enough (contracts.md); this is the
+            # same independent proof that also grants plain "enrolled".
+            return RunResult("already_enrolled", result.message, 0)
+        return result
+
+    def _verify(self, target: ExtraordinaryClass) -> RunResult:
+        """SPEC §16: read-only, independent, at most 3 queries with backoff.
+
+        A session bounce mid-verification re-logins and retries the SAME
+        verification query -- it never reconstructs or resends a confirmation.
+        """
+        del target  # is_enrolled() checks the one fixed product target itself.
+        query = 0
+        guard = 0
+        while query < _MAX_VERIFICATION_QUERIES and guard < _MAX_VERIFICATION_QUERIES + 3:
+            guard += 1
+            try:
+                response = self._session.get(PORTAL_URL)
+            except UFCGError:
+                query += 1
+                if query < _MAX_VERIFICATION_QUERIES:
+                    self._sleep(_VERIFICATION_BACKOFF[min(query - 1, len(_VERIFICATION_BACKOFF) - 1)])
+                continue
+            if _is_login_form_render(response.text):
+                try:
+                    self._session.login()
+                except UFCGError:
+                    pass
+                continue  # retry the same verification query, no query consumed
+            query += 1
+            _log("VERIFYING", attempt=query)
+            self._capture("verification", response.text)
+            if is_enrolled(response.text):
+                _log("ENROLLED")
+                return RunResult("enrolled", _ENROLLED_MESSAGE, 0)
+            if query < _MAX_VERIFICATION_QUERIES:
+                self._sleep(_VERIFICATION_BACKOFF[min(query - 1, len(_VERIFICATION_BACKOFF) - 1)])
+        _log("UNKNOWN")
+        return RunResult("unknown", _UNKNOWN_MESSAGE, 4)
 
     def _capture(self, label: str, html: str) -> None:
-        """Diagnostic-only (SPEC §20): never changes a request or a classification."""
+        """Diagnostic-only (SPEC §20): never changes a request or a classification.
+
+        A write failure (e.g. an exhausted/reused directory) degrades to a
+        logged warning; it never aborts the run.
+        """
         if self._capture_dir is None:
             return
         self._capture_count += 1
-        path = self._capture_dir / f"{self._capture_count:02d}-{label}.html"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.fchmod(fd, 0o600)  # belt-and-suspenders against a permissive umask
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(html)
+        path = self._capture_dir / f"{self._capture_count:04d}-{label}.html"
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.fchmod(fd, 0o600)  # belt-and-suspenders against a permissive umask
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(html)
+        except OSError as exc:
+            _log("CAPTURE_WARNING", file=path.name, reason=type(exc).__name__)
 
     @staticmethod
     def _safe_action(builder, *args) -> FormAction | None:
@@ -231,6 +435,27 @@ def _is_login_form_render(html: str) -> bool:
     return _LOGIN_FORM_MARKER in html
 
 
+def _is_available(target: ExtraordinaryClass) -> bool:
+    """SPEC §13: available on an explicit positive vacancy, or -- when vacancy
+    is unknown -- a selection control the parser recognized as enabled. Never
+    on an explicit zero.
+    """
+    if target.vacancies is not None:
+        return target.vacancies > 0
+    return bool(target.selection_fields)
+
+
+def _confirmation_matches_target(html: str, target: ExtraordinaryClass) -> bool:
+    """SPEC §15 item 3: re-verify component + turma on the confirmation page
+    itself, textually (its exact DOM shape is unconfirmed by a real capture).
+    """
+    normalized = " ".join(html.split())
+    if target.component_code not in normalized:
+        return False
+    class_pattern = re.compile(rf"turma\s*0*{re.escape(target.class_token)}\b", re.IGNORECASE)
+    return class_pattern.search(normalized) is not None
+
+
 def retry_delay(header: str | None, failures: int, interval: float, now: float) -> float:
     """SPEC §§17-18 retry delay: a valid `Retry-After` (delta-seconds or an
     HTTP-date, bounded to 1-300s) wins even over a larger configured
@@ -241,7 +466,10 @@ def retry_delay(header: str | None, failures: int, interval: float, now: float) 
     parsed = _parse_retry_after(header, now)
     if parsed is not None:
         return parsed
-    return max(interval, _BACKOFF_LADDER[min(failures - 1, 2)])
+    # `max(failures, 1) - 1` guards the (never-legitimate, but not worth
+    # crashing on) failures <= 0 case: plain negative indexing would silently
+    # wrap around and return the ladder's *last* (120s) entry instead.
+    return max(interval, _BACKOFF_LADDER[min(max(failures, 1) - 1, 2)])
 
 
 def _parse_retry_after(header: str | None, now: float) -> float | None:

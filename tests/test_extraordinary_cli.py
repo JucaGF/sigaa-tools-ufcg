@@ -164,6 +164,50 @@ def test_capture_inside_git_worktree_returns_five_before_any_session(monkeypatch
     assert not Path(inside).exists()
 
 
+def test_capture_dir_non_empty_returns_five_before_any_session(tmp_path, monkeypatch):
+    # Fix (review): a reused, populated --capture dir used to crash mid-flow
+    # on the worker's O_EXCL write (counter restarts at 1). Refused up front.
+    _never_open_session(monkeypatch)
+    flag = _never_touch_keyring(monkeypatch)
+    capture_dir = tmp_path / "capture"
+    capture_dir.mkdir()
+    (capture_dir / "0001-portal.html").write_text("leftover", encoding="utf-8")
+    args = _parse("--codigo", "1109103", "--turma", "02", "--capture", str(capture_dir))
+    assert cli_module._cmd_matricula_extraordinaria(args, None) == 5
+    assert not flag["called"]
+
+
+def test_capture_dir_empty_or_absent_is_accepted(tmp_path, monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "keyring",
+        SimpleNamespace(get_password=lambda s, k: "jucag" if k == "__active_username__" else "s3cr3t"),
+    )
+
+    class FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    class FakeWorker:
+        def __init__(self, session, confirmation_secret, capture_dir=None):
+            assert capture_dir is not None
+
+        def run(self, **kwargs):
+            return RunResult("period_closed", "matrícula extraordinária period is not open", 2)
+
+    monkeypatch.setattr(cli_module, "UFCGSession", FakeSession)
+    monkeypatch.setattr(cli_module, "ExtraordinaryWorker", FakeWorker)
+    capture_dir = tmp_path / "does-not-exist-yet"
+    args = _parse("--codigo", "1109103", "--turma", "02", "--capture", str(capture_dir))
+    assert cli_module._cmd_matricula_extraordinaria(args, None) == 2
+
+
 # --- credentials: keyring service sigaa-ufcg, env fallback -------------------
 
 
@@ -233,7 +277,7 @@ def test_username_resolves_from_active_keyring_entry_then_password_from_username
             return None
 
     class FakeWorker:
-        def __init__(self, session, confirmation_secret):
+        def __init__(self, session, confirmation_secret, capture_dir=None):
             assert confirmation_secret("password") == "s3cr3t"
 
         def run(self, **kwargs):
@@ -266,7 +310,7 @@ def test_username_falls_back_to_env_when_keyring_backend_errors(monkeypatch):
             return None
 
     class FakeWorker:
-        def __init__(self, session, confirmation_secret):
+        def __init__(self, session, confirmation_secret, capture_dir=None):
             pass
 
         def run(self, **kwargs):
@@ -351,7 +395,7 @@ def test_secrets_never_appear_in_stdout_or_stderr(monkeypatch, capsys):
             return None
 
     class FakeWorker:
-        def __init__(self, session, confirmation_secret):
+        def __init__(self, session, confirmation_secret, capture_dir=None):
             assert confirmation_secret("birth_date") == "S3ntinelBD"
 
         def run(self, **kwargs):

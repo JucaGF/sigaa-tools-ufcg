@@ -30,6 +30,84 @@ _EXTRAORDINARY_PATH = "/sigaa/graduacao/matricula/extraordinaria/matricula_extra
 _CLASS_RE = re.compile(r"(?:turma\s+)?0*(\d+)", re.IGNORECASE)
 _PERIOD_CLOSED_TEXT = "matrícula extraordinária não está disponível no momento"
 
+# Fixed selection target (SPEC §10.3): no fallback to another turma, ever.
+_TARGET_COMPONENT = "1109103"
+
+# Results-table header aliases -> canonical column key. Hypothesis pending a
+# real capture (see docs/superpowers/specs/2026-09-15-ufcg-extraordinaria-capture.md):
+# only the search *form* (form name="form", form:checkCodigo/txtCodigo/buscar)
+# is confirmed from a real UFCG render; the results table shape below is
+# derived from the UFPB regular-matrícula render of the same SIGAA family
+# (table class="formulario"), never a real UFCG extraordinária capture.
+_RESULTS_HEADER_MAP = {
+    "turma": "turma",
+    "código da turma": "turma",
+    "horário": "horario",
+    "vagas": "vagas",
+    "vagas ofertadas": "vagas",
+    "local": "local",
+    "sala": "local",
+}
+_COMPONENT_HEADER_RE = re.compile(r"(\d{6,9})\s*-\s*(.+?)\s*\(([^)]+)\)")
+_VACANCY_RE = re.compile(r"(\d+)\s*vaga")
+_JSFCLJS_RE = re.compile(r"jsfcljs\(document\.forms\[['\"][^'\"]+['\"]\],\s*['\"]([^'\"]*)['\"]")
+
+# Verification-page header aliases -> canonical column key (same hypothesis
+# caveat as above: no real "meu vínculo" render has been captured yet).
+_STATUS_HEADER_MAP = {
+    "componente": "componente",
+    "código": "componente",
+    "disciplina": "componente",
+    "turma": "turma",
+    "situação": "situacao",
+    "status": "situacao",
+    "período": "periodo",
+    "semestre": "periodo",
+}
+_TARGET_SEMESTER = "2026.2"
+
+# SPEC §22 message categories: fixed diagnostics, the raw body is never echoed.
+_UNKNOWN_RESPONSE = "resposta desconhecida"
+_MESSAGE_SELECTOR = "#painel-erros li, .info, .erros li, .aviso, .erro, #mensagens li"
+_MESSAGE_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("sem vaga", ("sem vaga", "não há vaga", "vaga indisponível", "não possui vaga")),
+    ("já matriculado", ("já matriculado", "já está matriculado", "já possui matrícula")),
+    ("choque de horário", ("choque de horário", "conflito de horário", "coincidência de horário")),
+    ("pré-requisito ou correquisito", ("pré-requisito", "pre-requisito", "correquisito", "co-requisito")),
+    ("limite de carga horária", ("limite de carga horária", "carga horária máxima", "excede a carga horária")),
+    (
+        "matrícula on-line não permitida",
+        ("não permite matrícula on-line", "matrícula on-line não permitida", "matrícula on-line não é permitida"),
+    ),
+    ("período fechado", (_PERIOD_CLOSED_TEXT, "período de matrícula extraordinária encerrado", "fora do período")),
+    (
+        "dados de confirmação incorretos",
+        ("senha incorreta", "dados informados são inválidos", "confirmação inválida",
+         "dados de confirmação incorretos", "data de nascimento não confere"),
+    ),
+    ("sessão expirada", ("sessão expirada", "sessão foi encerrada", "sua sessão expirou")),
+    ("indisponibilidade do sistema", ("sistema indisponível", "manutenção", "tente novamente mais tarde")),
+)
+
+_BIRTHDATE_HINT_RE = re.compile(r"nasc|birth", re.IGNORECASE)
+
+
+class AmbiguousSelectionError(ValueError):
+    """Two results rows normalize to the same target component + turma (fail closed)."""
+
+
+@dataclass(frozen=True)
+class ExtraordinaryClass:
+    """SPEC §13: only the fields that drive selection, logs or diagnostics."""
+
+    component_code: str
+    class_token: str
+    class_label: str
+    vacancies: int | None
+    schedule_raw: str | None
+    room: str | None
+    selection_fields: tuple[tuple[str, str], ...]
+
 
 @dataclass(frozen=True)
 class FormAction:
@@ -203,3 +281,259 @@ def _require_viewstate(hidden_nodes, context: str) -> None:
         for node in hidden_nodes
     ):
         raise ValueError(f"{context} has no javax.faces.ViewState")
+
+
+def _normalize_header(text: str) -> str:
+    collapsed = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text)).strip()
+    return collapsed.casefold()
+
+
+def _find_results_table(soup: BeautifulSoup) -> Tag | None:
+    table = soup.find("table", id=re.compile(r"resultado|turmas", re.IGNORECASE))
+    if table is not None:
+        return table
+    for candidate in soup.find_all("table"):
+        for row in candidate.find_all("tr"):
+            headers = {_normalize_header(th.get_text(" ", strip=True)) for th in row.find_all("th")}
+            if "turma" in headers:
+                return candidate
+    return None
+
+
+def parse_classes(html: str) -> list[ExtraordinaryClass]:
+    """Extraordinária results table -> rows, SPEC §13.
+
+    Raises ``ValueError`` when no recognizable results table is present at
+    all (an unmodeled/unknown render -- the caller must fail closed, never
+    guess). An empty list is returned when the table *is* recognized but no
+    row matches anything (e.g. the searched component is simply absent).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    table = _find_results_table(soup)
+    if table is None:
+        raise ValueError("extraordinária results table not found")
+
+    component: str | None = None
+    columns: dict[str, int] = {}
+    results: list[ExtraordinaryClass] = []
+    for row in table.find_all("tr"):
+        ths = row.find_all("th")
+        if ths:
+            if len(ths) == 1 and ths[0].get("colspan"):
+                match = _COMPONENT_HEADER_RE.search(ths[0].get_text(" ", strip=True))
+                if match:
+                    component = match.group(1)
+                continue
+            columns = {}
+            for index, th in enumerate(ths):
+                key = _RESULTS_HEADER_MAP.get(_normalize_header(th.get_text(" ", strip=True)))
+                if key is not None:
+                    columns[key] = index
+            continue
+        tds = row.find_all("td")
+        if not tds or not columns or component is None:
+            continue
+        cls = _row_to_class(component, tds, columns, row)
+        if cls is not None:
+            results.append(cls)
+    return results
+
+
+def _cell_text_or_none(tds: list[Tag], index: int | None) -> str | None:
+    if index is None or index >= len(tds):
+        return None
+    text = tds[index].get_text(" ", strip=True)
+    return text or None
+
+
+def _parse_vacancies(text: str | None) -> int | None:
+    if text is None:
+        return None
+    match = _VACANCY_RE.search(text)
+    if match:
+        return int(match.group(1))
+    stripped = text.strip()
+    return int(stripped) if stripped.isdigit() else None
+
+
+def _parse_jsfcljs(href: str) -> tuple[tuple[str, str], ...]:
+    match = _JSFCLJS_RE.search(href)
+    if not match:
+        return ()
+    pairs = []
+    for chunk in match.group(1).split(","):
+        if ":" not in chunk:
+            continue
+        key, value = chunk.split(":", 1)
+        pairs.append((key, value))
+    return tuple(pairs)
+
+
+def _selection_fields_from_row(row: Tag) -> tuple[tuple[str, str], ...]:
+    link = row.find("a", href=re.compile(r"jsfcljs\("))
+    if link is not None and link.get("disabled") is None:
+        pairs = _parse_jsfcljs(link["href"])
+        if pairs:
+            return pairs
+    button = row.find("input", attrs={"type": re.compile("^(submit|image)$", re.IGNORECASE), "name": True})
+    if button is not None and button.get("disabled") is None and button.get("value") is not None:
+        return ((button["name"], button.get("value", "")),)
+    checkbox = row.find("input", attrs={"type": re.compile("^(checkbox|radio)$", re.IGNORECASE), "name": True})
+    if checkbox is not None and checkbox.get("disabled") is None and checkbox.get("value"):
+        return ((checkbox["name"], checkbox["value"]),)
+    return ()
+
+
+def _row_to_class(
+    component_code: str, tds: list[Tag], columns: dict[str, int], row: Tag
+) -> ExtraordinaryClass | None:
+    turma_index = columns.get("turma")
+    if turma_index is None or turma_index >= len(tds):
+        return None
+    class_label = tds[turma_index].get_text(" ", strip=True)
+    if not class_label:
+        return None
+    return ExtraordinaryClass(
+        component_code=component_code,
+        class_token=normalize_class(class_label),
+        class_label=class_label,
+        vacancies=_parse_vacancies(_cell_text_or_none(tds, columns.get("vagas"))),
+        schedule_raw=_cell_text_or_none(tds, columns.get("horario")),
+        room=_cell_text_or_none(tds, columns.get("local")),
+        selection_fields=_selection_fields_from_row(row),
+    )
+
+
+def select_target(rows: list[ExtraordinaryClass]) -> ExtraordinaryClass | None:
+    """SPEC §10.3: exact component + turma match, never a turma-01 fallback."""
+    target_token = normalize_class("02")
+    matches = [
+        row for row in rows
+        if row.component_code == _TARGET_COMPONENT and normalize_class(row.class_token) == target_token
+    ]
+    if len(matches) > 1:
+        raise AmbiguousSelectionError(
+            "extraordinária results are ambiguous: more than one row normalizes to the target"
+        )
+    return matches[0] if matches else None
+
+
+def selection_action(html: str, url: str, row: ExtraordinaryClass) -> FormAction:
+    soup = BeautifulSoup(html, "lxml")
+    form = soup.find("form", attrs={"name": "form"})
+    if form is None:
+        raise ValueError("extraordinária results form not found")
+    _require_viewstate(form.select('input[type="hidden"][name]'), "extraordinária results form")
+    fields = build_form_payload(form, list(row.selection_fields))
+    return FormAction(urljoin(url, form["action"]), tuple(fields))
+
+
+def _find_confirmation_form(soup: BeautifulSoup) -> Tag | None:
+    for form in soup.find_all("form"):
+        if form.select_one('input[type="password"][name]') is not None:
+            return form
+    return None
+
+
+def _find_birthdate_field(form: Tag, password_name: str) -> Tag | None:
+    for node in form.select('input[type="date"], input[type="text"]'):
+        name = node.get("name")
+        if not name or name == password_name:
+            continue
+        if _BIRTHDATE_HINT_RE.search(name) or _BIRTHDATE_HINT_RE.search(node.get("id") or ""):
+            return node
+    return None
+
+
+def _identity_fields(html: str) -> tuple[Tag, dict[str, str]]:
+    soup = BeautifulSoup(html, "lxml")
+    form = _find_confirmation_form(soup)
+    if form is None:
+        raise ValueError("extraordinária confirmation form not found")
+    password_field = form.select_one('input[type="password"][name]')
+    if password_field is None:
+        raise ValueError("extraordinária confirmation form has no password field")
+    names = {"password": password_field["name"]}
+    birthdate_field = _find_birthdate_field(form, password_field["name"])
+    if birthdate_field is not None:
+        names["birth_date"] = birthdate_field["name"]
+    return form, names
+
+
+def confirmation_identity_fields(html: str) -> dict[str, str]:
+    """The confirmation form's identity field *names* (never values/secrets)."""
+    _, names = _identity_fields(html)
+    return names
+
+
+def confirmation_action(html: str, url: str) -> FormAction:
+    form, names = _identity_fields(html)
+    _require_viewstate(form.select('input[type="hidden"][name]'), "extraordinária confirmation form")
+    overrides = [(name, "") for name in names.values()]
+    fields = build_form_payload(form, overrides)
+    return FormAction(urljoin(url, form["action"]), tuple(fields))
+
+
+def is_enrolled(html: str) -> bool:
+    """SPEC §16: component 1109103 + turma 02 + MATRICULADO in the SAME row,
+    for semester 2026.2. Any other component/turma, an explicit
+    ``NÃO MATRICULADO``, a bodiless success message, or a historical semester
+    (a Período/Semestre column present and not matching) is False.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    target_token = normalize_class("02")
+    for table in soup.find_all("table"):
+        columns: dict[str, int] = {}
+        for row in table.find_all("tr"):
+            ths = row.find_all("th")
+            if ths:
+                columns = {}
+                for index, th in enumerate(ths):
+                    key = _STATUS_HEADER_MAP.get(_normalize_header(th.get_text(" ", strip=True)))
+                    if key is not None:
+                        columns[key] = index
+                continue
+            if not columns:
+                continue
+            tds = row.find_all("td")
+            if _row_shows_enrollment(tds, columns, target_token):
+                return True
+    return False
+
+
+def _row_shows_enrollment(tds: list[Tag], columns: dict[str, int], target_token: str) -> bool:
+    component_index = columns.get("componente")
+    turma_index = columns.get("turma")
+    status_index = columns.get("situacao")
+    if component_index is None or turma_index is None or status_index is None:
+        return False
+    if component_index >= len(tds) or turma_index >= len(tds) or status_index >= len(tds):
+        return False
+    component_text = tds[component_index].get_text(" ", strip=True)
+    if _TARGET_COMPONENT not in component_text:
+        return False
+    turma_text = tds[turma_index].get_text(" ", strip=True)
+    if normalize_class(turma_text) != target_token:
+        return False
+    status_text = _normalize_header(tds[status_index].get_text(" ", strip=True))
+    if "não matriculado" in status_text or "matriculado" not in status_text:
+        return False
+    period_index = columns.get("periodo")
+    if period_index is not None and period_index < len(tds):
+        period_text = tds[period_index].get_text(" ", strip=True)
+        if period_text and period_text != _TARGET_SEMESTER:
+            return False
+    return True
+
+
+def classify_message(html: str) -> str:
+    """SPEC §22: a fixed diagnostic category, never the raw sanitized text."""
+    soup = BeautifulSoup(html, "lxml")
+    texts = [_normalize_header(node.get_text(" ", strip=True)) for node in soup.select(_MESSAGE_SELECTOR)]
+    if not texts:
+        texts = [_normalize_header(soup.get_text(" ", strip=True))]
+    for text in texts:
+        for category, needles in _MESSAGE_CATEGORIES:
+            if any(_normalize_header(needle) in text for needle in needles):
+                return category
+    return _UNKNOWN_RESPONSE

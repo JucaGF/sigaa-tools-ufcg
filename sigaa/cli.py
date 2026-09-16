@@ -644,6 +644,16 @@ def _capture_dir_inside_git_worktree(path: Path) -> bool:
     return any((candidate / ".git").exists() for candidate in (resolved, *resolved.parents))
 
 
+def _capture_dir_non_empty(path: Path) -> bool:
+    """True when ``path`` already exists and holds at least one entry.
+
+    A reused, populated capture directory restarts the worker's per-process
+    numbered-file counter at 1, so a second run's O_EXCL write would crash
+    mid-flow (fix: refuse this up front, next to the git-work-tree check).
+    """
+    return path.exists() and any(path.iterdir())
+
+
 def _ufcg_result(args, status: str, message: str, exit_code: int) -> int:
     """Emit the SPEC §21 output contract: JSON has exactly status/component_code/class/message."""
     if args.json:
@@ -682,6 +692,11 @@ def _cmd_matricula_extraordinaria(args, settings) -> int:
                     args, "error",
                     f"--capture must be outside the git work tree (refused: {capture_path})", 5,
                 )
+            if _capture_dir_non_empty(capture_path):
+                return _ufcg_result(
+                    args, "error",
+                    f"--capture directory is not empty, refusing to reuse it: {capture_path}", 5,
+                )
             capture_dir = capture_path
 
         username = _ufcg_username()
@@ -700,9 +715,8 @@ def _cmd_matricula_extraordinaria(args, settings) -> int:
                 raise UFCGError(f"UFCG {kind} not configured", category="auth")
             return secret
 
-        worker_kwargs = {"capture_dir": capture_dir} if capture_dir is not None else {}
         with UFCGSession(username, lambda: confirmation_secret("password")) as session:
-            worker = ExtraordinaryWorker(session, confirmation_secret, **worker_kwargs)
+            worker = ExtraordinaryWorker(session, confirmation_secret, capture_dir=capture_dir)
             result = worker.run(confirm=args.confirm, watch=args.watch, interval=args.interval)
     except KeyboardInterrupt:
         print("\nmatrícula extraordinária: interrupted", file=sys.stderr)

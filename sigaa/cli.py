@@ -188,7 +188,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_extra = sub.add_parser(
         "matricula-extraordinaria",
-        help="UFCG matrícula extraordinária: dry-run search only in this version (networked)",
+        help="UFCG matrícula extraordinária: dry-run by default, live enrollment with --confirm (networked)",
     )
     p_extra.add_argument("--codigo", required=True, help="component code (must be 1109103)")
     p_extra.add_argument("--turma", required=True, help="turma label (must normalize to 02)")

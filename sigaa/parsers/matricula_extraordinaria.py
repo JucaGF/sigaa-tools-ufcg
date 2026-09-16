@@ -49,6 +49,10 @@ _RESULTS_HEADER_MAP = {
     "sala": "local",
 }
 _COMPONENT_HEADER_RE = re.compile(r"(\d{6,9})\s*-\s*(.+?)\s*\(([^)]+)\)")
+# Leading component code of a "<code> - <name>" cell, same extract-then-compare
+# approach as the results header above: a code that merely contains the
+# target as a substring (e.g. "21109103") must never match it.
+_COMPONENT_CODE_RE = re.compile(r"^\s*(\d{6,9})")
 _VACANCY_RE = re.compile(r"(\d+)\s*vaga")
 _JSFCLJS_RE = re.compile(r"jsfcljs\(document\.forms\[['\"][^'\"]+['\"]\],\s*['\"]([^'\"]*)['\"]")
 
@@ -67,7 +71,8 @@ _STATUS_HEADER_MAP = {
 _TARGET_SEMESTER = "2026.2"
 # Word-boundary match so "desmatriculado" (a real, distinct negative status)
 # never reads as proof: "matriculado" is a substring of it but never a word.
-_ENROLLED_STATUS_RE = re.compile(r"\bmatriculado\b", re.IGNORECASE)
+# No re.IGNORECASE: status_text is already casefolded by _normalize_header.
+_ENROLLED_STATUS_RE = re.compile(r"\bmatriculado\b")
 
 # SPEC §22 message categories: fixed diagnostics, the raw body is never echoed.
 _UNKNOWN_RESPONSE = "resposta desconhecida"
@@ -230,11 +235,11 @@ def _selected_option_value(select: Tag) -> str:
 
 
 def search_action(html: str, url: str, code: str) -> FormAction:
-    """Build the search postback: only the three documented fields are filled.
-
-    ``form:checkCodigo`` is checked, ``form:txtCodigo`` gets ``code``, and
-    ``form:buscar`` is sent with whatever label the current render's submit
-    button carries. Every other hidden field is copied as-is.
+    """Build the search postback: ``form:checkCodigo`` is checked,
+    ``form:txtCodigo`` gets ``code``, and ``form:buscar`` is sent with
+    whatever label the current render's submit button carries. Every hidden
+    field is copied as-is, and every ``<select>`` is sent with its currently
+    selected option's value (the department combo rejects an omitted select).
     """
     soup = BeautifulSoup(html, "lxml")
     form = soup.find("form", attrs={"name": "form"})
@@ -597,7 +602,8 @@ def _row_shows_enrollment(tds: list[Tag], columns: dict[str, int], target_token:
     if component_index >= len(tds) or turma_index >= len(tds) or status_index >= len(tds):
         return False
     component_text = tds[component_index].get_text(" ", strip=True)
-    if _TARGET_COMPONENT not in component_text:
+    component_match = _COMPONENT_CODE_RE.match(component_text)
+    if component_match is None or component_match.group(1) != _TARGET_COMPONENT:
         return False
     turma_text = tds[turma_index].get_text(" ", strip=True)
     if normalize_class(turma_text) != target_token:

@@ -173,7 +173,8 @@ class UFCGSession:
 
     @staticmethod
     def _retry_after(response: httpx.Response) -> float | None:
-        # Simple digit-seconds only; full Retry-After (HTTP-date, bounds) is Task 5.
+        # Simple digit-seconds only; HTTP-date and bounds are handled downstream
+        # by extraordinary.retry_delay, which clamps this value into its backoff.
         header = response.headers.get("retry-after")
         if header and header.isascii() and header.isdecimal():
             return float(int(header))

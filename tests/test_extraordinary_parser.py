@@ -621,6 +621,19 @@ def test_is_enrolled_true_still_holds_for_the_plain_positive_case():
     assert is_enrolled(_fixture("enrolled.html")) is True
 
 
+def test_is_enrolled_false_on_decoy_code_containing_target_as_substring():
+    # A component code that merely *contains* the target digits (e.g. a typo
+    # or a different discipline sharing the suffix) must never prove the
+    # bond: the code must match exactly, not just "in" the cell text.
+    html = """
+    <table class="formulario">
+      <tr><th>Componente</th><th>Turma</th><th>Situação</th><th>Período</th></tr>
+      <tr><td>21109103 - OUTRA DISCIPLINA</td><td>02</td><td>MATRICULADO</td><td>2026.2</td></tr>
+    </table>
+    """
+    assert is_enrolled(html) is False
+
+
 # --- round 2 review fix #5: no recognized control -> fail closed, never post ---
 
 

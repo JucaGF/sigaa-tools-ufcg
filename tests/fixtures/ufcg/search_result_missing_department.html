@@ -1,0 +1,28 @@
+<!-- synthetic: sanitized from a real UFCG render captured 2026-09-16, PII and
+     tokens replaced. The real search-result page when the search POST omits
+     the department <select> (a browser always submits its selected option;
+     an earlier payload here omitted it because selects are not hidden
+     inputs): SIGAA rejects the whole POST with this validation error. -->
+<html>
+<head><title>Matrícula Extraordinária</title></head>
+<body>
+<div id="painel-erros" style="position: relative; padding-bottom: 10px;">
+  <ul class="erros">
+    <li>form:comboDepartamento: Campo obrigatório não informado ou valor informado para o campo é inválido.</li>
+  </ul>
+</div>
+<form id="form" name="form" method="post"
+      action="/sigaa/graduacao/matricula/extraordinaria/matricula_extraordinaria.jsf" enctype="application/x-www-form-urlencoded">
+  <input type="hidden" name="form" value="form">
+  <table class="formulario" width="90%">
+    <tr>
+      <td><input type="checkbox" name="form:checkCodigo" value="on"></td>
+      <td><input type="text" name="form:txtCodigo" value="1109103"></td>
+    </tr>
+  </table>
+  <input type="submit" name="form:buscar" value="Buscar">
+  <input type="submit" name="form:cancelar" value="Cancelar">
+  <input type="hidden" name="javax.faces.ViewState" id="javax.faces.ViewState" value="render-fake-0010">
+</form>
+</body>
+</html>

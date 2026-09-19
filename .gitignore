@@ -18,6 +18,7 @@ venv/
 /.codex/config.toml
 
 # Live SIGAA dumps (may contain personal data)
+/captures/sigaa-ufcg/
 /tmp/sigaa_*
 *.local.html
 /historico.pdf
@@ -35,3 +36,6 @@ venv/
 # Claude Code transcripts
 *-local-command-caveat*.txt
 2026-06-17-141152-local-command-caveatcaveat-the-messages-below.txt
+
+# Local-only: the SPEC stays out of the remote by the author's decision (17/09/2026).
+docs/superpowers/specs/2026-09-14-ufcg-matricula-extraordinaria-agent-design.md

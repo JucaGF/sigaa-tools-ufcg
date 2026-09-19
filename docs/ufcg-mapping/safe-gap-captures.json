@@ -1,0 +1,55 @@
+{
+  "captured_at": "2026-09-19",
+  "privacy": {
+    "raw_html_saved": false,
+    "personal_values_saved": false,
+    "document_bodies_opened": false,
+    "jsf_viewstate_saved": false
+  },
+  "extraordinary_offer_detail": {
+    "path": "/sigaa/graduacao/matricula/extraordinaria/matricula_extraordinaria.jsf",
+    "table_classes": ["visualizacao", "subFormulario", "subformluario"],
+    "labels": ["Período Letivo:", "Componente e Turma:", "Tipo do Componente:", "Tipo da Turma:", "Local e Horário:", "Capacidade:", "Vagas Reservadas (Ingressantes/Demais)"]
+  },
+  "extraordinary_confirmation": {
+    "render_path": "/sigaa/graduacao/matricula/extraordinaria/matricula_extraordinaria.jsf",
+    "form_action": "/sigaa/graduacao/matricula/extraordinaria/confirmacao.jsf",
+    "method": "POST",
+    "fields": [
+      {"suffix": "inputHiddenOpcaoExibir", "type": "hidden"},
+      {"name": "apenasSenha", "type": "hidden"},
+      {"suffix": "cpf", "type": "text"},
+      {"suffix": "senha", "type": "password"},
+      {"suffix": "btnConfirmar", "type": "submit"},
+      {"suffix": "btnRealizarNovaMatricula", "type": "submit"}
+    ],
+    "submit_labels": ["Confirmar Matrícula", "Realizar Outra Matrícula Extraordinária"],
+    "confirmation_submitted": false
+  },
+  "curriculum_detail": {
+    "render_path": "/sigaa/graduacao/curriculo/lista.jsf",
+    "form_action": "/sigaa/geral/estrutura_curricular/resumo.jsf",
+    "form_name": "formulario",
+    "method": "POST",
+    "fields": ["formulario", "formulario:tab_painel"],
+    "level_count": 10,
+    "row_count": 267,
+    "labels": ["Código:", "Matriz Curricular:", "Período Letivo de Entrada em Vigor:", "Carga Horária Mínima:", "Subtotal de CH de Aula:", "Subtotal de CH de Orientação Acadêmica/Profissional:", "Total:", "Carga Horária Optativa Mínima:", "Carga Horária Complementar Mínima:", "Carga Horária EAD Total:", "Carga Horária Obrigatória de Atividade Acadêmica Específica:", "Carga Horária Máxima de Componentes Eletivos:", "Carga Horária Máxima por Período Letivo:", "Prazo Para Conclusão (em semestres):", "Mínimo:", "Médio:", "Máximo:"]
+  },
+  "document_actions": {
+    "portal_form": "menu:form_menu_discente",
+    "history_action": "#{ portalDiscente.historico }",
+    "declaration_action": "#{ declaracaoVinculo.emitirDeclaracao }",
+    "content_opened": false,
+    "reason": "User requested that no sensitive document data be captured."
+  },
+  "schedule_contract": {
+    "source": "https://portal.pre.ufcg.edu.br/phocadownload/SIGAA/Manual-SIGAA-discentes.pdf",
+    "days": {"1": "domingo", "2": "segunda", "3": "terça", "4": "quarta", "5": "quinta", "6": "sexta", "7": "sábado"},
+    "slots": {
+      "M1": ["07:00", "08:00"], "M2": ["08:00", "09:00"], "M3": ["09:00", "10:00"], "M4": ["10:10", "11:10"], "M5": ["11:10", "12:10"],
+      "T1": ["13:00", "14:00"], "T2": ["14:00", "15:00"], "T3": ["15:00", "16:00"], "T4": ["16:10", "17:10"], "T5": ["17:10", "18:10"],
+      "N1": ["18:30", "19:20"], "N2": ["19:20", "20:10"], "N3": ["20:10", "21:10"], "N4": ["21:10", "22:00"]
+    }
+  }
+}

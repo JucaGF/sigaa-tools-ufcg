@@ -78,6 +78,112 @@ Agents can call `sipac_get_public_process` with `{"number": "23074.056437/2026-2
 Headless fallback: `export SIGAA_USER=... SIGAA_PASS=...`.
 Optional `SIGAA_DB=/path/to/sigaa.db` to override the store location.
 
+## UFCG matrícula extraordinária (experimental; dry-run by default, `--confirm` is live)
+
+A separate, local, deterministic worker for the UFCG SIGAA (not UFPB): it
+logs in, opens matrícula extraordinária, and searches component `1109103`
+turma `02` — the only target this version supports. It never touches the
+UFPB session/config/keyring, the regular `matricula` command, or the MCP
+server.
+
+```bash
+sigaa matricula-extraordinaria --codigo 1109103 --turma 02 --json
+```
+
+By default this is a **dry-run**: it authenticates, opens the extraordinária,
+selects turma 02 of component 1109103, and stops at `prepared` (exit 0)
+without sending anything. Pass **`--confirm`** to actually submit: it sends
+the SIGAA confirmation POST exactly once for the prepared attempt, then
+re-checks the resulting enrollment bond before reporting `enrolled`,
+`rejected`, or `unknown` — this is a real, live mutation of your SIGAA
+enrollment, authorized only for component `1109103` turma `02`. `--watch`
+polls with backoff (SPEC §18) while the period is closed or a transient
+error occurs.
+
+Credentials use their own keyring service, **`sigaa-ufcg`** (separate from
+UFPB's `sigaa-ufpb`):
+
+| Secret | Keyring key (service `sigaa-ufcg`) | Env fallback |
+| --- | --- | --- |
+| Username | `__active_username__` | `SIGAA_USER` |
+| Password | `<username>` | `SIGAA_PASS` |
+| Birth date (only if the confirmation form asks for it) | `<username>:birth_date` | `SIGAA_BIRTH_DATE` |
+
+A missing or erroring keyring backend falls back to the environment
+variables. The global `--user` override is not supported for this command
+(it always resolves its own `sigaa-ufcg` identity) and returns exit 5 if
+passed.
+
+Exit codes (SPEC §24):
+
+| Code | Meaning |
+| --- | --- |
+| 0 | `enrolled`, `already_enrolled`, or `prepared` (dry-run) |
+| 2 | `period_closed`, `target_not_found`, or `no_vacancy` — only when `--watch` was **not** passed (with `--watch` these keep polling instead of exiting) |
+| 3 | `rejected` — a SIGAA academic rule refused the request (e.g. no vacancy at confirmation time, schedule clash); terminal, never retried |
+| 4 | `unknown` — the confirmation POST was sent but the post-confirmation check could not prove the bond either way |
+| 5 | auth/config error (bad credentials, unsupported `--user`, invalid flags) |
+| 6 | protocol/DOM error — a SIGAA render didn't match what the parser expects; fails closed, sends nothing |
+| 7 | network error, or session expiry, after all allowed retries |
+| 130 | interrupted (Ctrl-C) |
+
+See
+`docs/superpowers/specs/2026-09-14-ufcg-matricula-extraordinaria-agent-design.md`
+for the full design and phase plan.
+
+### Operator runbook
+
+**The three commands (SPEC §19):**
+
+```bash
+# Dry-run: authenticate, open, search, select, stop at `prepared`. Sends nothing.
+sigaa matricula-extraordinaria --codigo 1109103 --turma 02 --json
+
+# Poll while the period is closed or the target is unavailable. Still sends nothing.
+sigaa matricula-extraordinaria --codigo 1109103 --turma 02 --watch --json
+
+# Poll, and submit the confirmation POST the moment a prepared attempt succeeds.
+# This is the only command that can mutate your enrollment.
+sigaa matricula-extraordinaria --codigo 1109103 --turma 02 --watch --confirm --json
+```
+
+**Credentials:** see the keyring/env table above. Rotate any password that
+was ever shared during research or debugging before using it for a real run
+(SPEC §20) — a password typed into chat, a log, or a screen share is
+compromised for this purpose even if nothing else changed.
+
+**`--capture DIR`:** diagnostic-only flag that writes every HTML render the
+worker sees to `DIR`, one file per render. It creates `DIR` at mode `0700`
+and each file at `0600`, and refuses to run if `DIR` is inside this git work
+tree or already non-empty (so a capture can never leak into a commit or
+silently mix with a previous run). Captured HTML contains personal data
+(name, registration number, session tokens) and **must be sanitized**
+(PII, cookies, ViewState, and any other identifying values stripped) before
+any of it is turned into a test fixture.
+
+**After an `unknown` (exit 4) result:** stop. Log into SIGAA by hand and
+check whether the enrollment actually went through *before* running the
+command again with `--confirm`. Restarting the process is not authorization
+to re-send the confirmation — `unknown` means the POST was already sent and
+its outcome is unconfirmed, not that nothing happened.
+
+**No scheduler, no resume:** there is no built-in cron/scheduler and no
+persisted state between runs. Each process invocation is exactly one dry-run
+attempt or one `--watch` session; if you kill it, restart it manually and it
+starts over from login.
+
+**What's live-verified vs. still hypothesis (as of 2026-09-16):** login,
+portal recognition, opening the extraordinária, searching, and classifying
+period-closed and no-vacancy responses have all been exercised against the
+real UFCG SIGAA and work. The results table with actual rows, row selection,
+the confirmation page, and the post-confirmation verification page have
+never been captured, because no live search for `1109103`/`02` has ever
+returned a row with vacancies — every parser for those pages is written
+against a same-SIGAA-family prior and fails closed (exit 6) rather than
+guessing if the real render doesn't match. `--capture` exists so that the
+first time a vacancy does appear, the real render gets captured instead of
+lost.
+
 ## MCP server (for code agents)
 
 Run `sigaa init`; it can detect or create `.mcp.json` and add the `sigaa` MCP
